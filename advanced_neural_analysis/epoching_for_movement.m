@@ -1,0 +1,554 @@
+clearvars; clc; close all;
+
+% file paths: change these to run on another computer or participant
+behDir  = 'C:\Users\rashm\Documents\opm_pi\participant_001\Behavioural_Data_001_01\Matlab';
+megDir  = 'C:\Users\rashm\Documents\opm_pi\participant_001\preprocessed';
+megFile = 'prep_p001_block%02d.mat';
+outDir  = fullfile(behDir, '..', 'results', 'p001');
+
+cfg = config();   % config.m must be on the MATLAB path
+
+askBeforeEpoching = true;
+includeRejected   = true;
+roomLim   = [-2 2];
+reclassifyInteractive = true;
+reclassFile = fullfile(outDir, 'reclassified_attempts_p001.csv');   % saved reclassifications / exclusions
+manualExclude = [];
+
+P.fs = 50; P.smoothWin = 0.5; P.dirWin = 1.5; P.speedThr = 0.2;
+P.dirTol = 35;
+P.bridge = 0.3; P.trim = 0.5; P.chunk = 1.0; P.endTol = 45;
+P.plateauFrac = 0.5;
+
+if ~exist(outDir, 'dir'), mkdir(outDir); end
+
+files  = dir(fullfile(behDir, cfg.master_data_pattern));
+namePattern = '^[Pp](?:articipant)?[_\- ]?(\d+)[_\- ](\d+)(?:[_\- ]|$)';
+tok    = arrayfun(@(d) regexp(d.name, namePattern, 'tokens', 'once'), files, 'UniformOutput', false);
+files  = files(~cellfun(@isempty, tok));  tok = tok(~cellfun(@isempty, tok));
+blocks = cellfun(@(t) str2double(t{2}), tok);
+[blocks, ord] = sort(blocks);
+files  = files(ord);
+
+RC = load_reclass(reclassFile);
+B = [];
+RAW = {};
+SER = struct('t', {}, 'speed', {}, 'x', {}, 'z', {}, 'ia', {}, 'ic', {});
+for b = 1:numel(files)
+    S  = load(fullfile(files(b).folder, files(b).name));
+    MD = S.MasterData;
+    for i = 1:numel(MD)
+        r = struct();
+        r.Block      = blocks(b);
+        r.Order      = i;
+        r.TrialNum   = double(MD(i).TrialNum);
+        r.Attempt    = double(MD(i).Attempt);
+        r.Status     = char(MD(i).Status);
+        if strcmp(r.Status, 'Aborted_Mid_Trial'), r.TrialStatus = 'REJECTED';
+        else, r.TrialStatus = 'ACCEPTED'; end
+        r.Position   = char(MD(i).Position);
+        r.Angle      = double(MD(i).StartAngleDeg);
+        r.DistCode   = char(MD(i).DistCode);
+        r.TargetDist = double(MD(i).TargetDist);
+        r.OrigPosition = r.Position;
+        r.OrigAngle    = r.Angle;
+        r.Reclassified   = false;
+        r.ManualExcluded = ismember(r.TrialNum, manualExclude);
+        k = find(RC.Block == r.Block & RC.TrialNum == r.TrialNum & RC.Attempt == r.Attempt, 1, 'last');
+        if ~isempty(k)
+            if strcmp(RC.Action{k}, 'exclude')
+                r.ManualExcluded = true;
+            else
+                r.Position = RC.NewPosition{k}; r.Angle = RC.NewAngle(k); r.Reclassified = true;
+            end
+        end
+
+        sp = get_trace(MD(i).Traces, 'StartPosTorsoTrace');
+        ce = [last_time(get_trace(MD(i).Traces, 'CloseEyesTorsoTrace')), ...
+              last_time(get_trace(MD(i).Traces, 'CloseEyesHeadTrace'))];
+        r.behSetupStart = first_time(sp);
+        r.behSetupEnd   = last_time(sp);
+        r.behCloseEyes  = max(ce);
+        cs = [first_time(get_trace(MD(i).Traces, 'CloseEyesTorsoTrace')), ...
+              first_time(get_trace(MD(i).Traces, 'CloseEyesHeadTrace'))];
+        r.behCloseStart = min(cs);
+        oe = [first_time(get_trace(MD(i).Traces, 'OpenEyesTorsoTrace')), ...
+              first_time(get_trace(MD(i).Traces, 'OpenEyesHeadTrace'))];
+        r.behOpenEyes   = min(oe);
+
+        E = walking_period(sp, r.Angle, P);
+        RAW{numel(B) + 1} = sp;
+        SER(numel(B) + 1) = struct('t', E.tRel, 'speed', E.speed, 'x', E.x, 'z', E.z, ...
+            'ia', E.ia, 'ic', E.ic);
+        r.StartsAtTraceStart = E.startsAtTraceStart;
+        r.behWalkStart = E.walkStart;
+        r.behWalkEnd   = E.walkEnd;
+        r.WalkDur      = E.walkEnd - E.walkStart;
+        r.Excluded = E.excluded;
+        if r.ManualExcluded, r.Excluded = 'manually excluded'; end
+        B = [B; r];
+    end
+end
+TB = struct2table(B);
+TB = derive_columns(TB, includeRejected);
+isRej = strcmp(TB.TrialStatus, 'REJECTED');
+
+pos9     = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
+angleOf  = arrayfun(@(k) TB.OrigAngle(find(strcmp(TB.OrigPosition, pos9{k}), 1)), 1:9);
+
+fW  = figure('Color', 'w', 'Position', [40 40 1300 1300]);
+axW = draw_walk_patterns(fW, TB, SER, P, roomLim);
+drawnow;
+
+if reclassifyInteractive
+    answer = questdlg({'Do you want to move any walk to a different angle,', ...
+        'or leave a walk out of the analysis?', '', ...
+        'Yes: click walks in the figure.  No: continue as shown.'}, ...
+        'Reclassify or exclude walks', 'Yes', 'No', 'No');
+    while strcmp(answer, 'Yes')
+        figure(fW);
+        fprintf(['\nClick the walk you want to change in the figure.\n', ...
+            'When you are done, press Enter with the figure window selected.\n']);
+        [xc, yc] = ginput(1);
+        if isempty(xc), break; end
+        p = find(axW == gca, 1);
+        if isempty(p), continue; end
+        cand = find(strcmp(TB.Position, pos9{p}));
+        dmin = inf(size(cand));
+        for q = 1:numel(cand)
+            S = SER(cand(q));
+            if ~isempty(S.x), dmin(q) = min(hypot(S.x - xc, S.z - yc)); end
+        end
+        [dBest, q] = min(dmin);
+        if isempty(cand) || dBest > 0.25
+            fprintf('  No walk within 0.25 m of that click in %s.\n', pos9{p});
+            continue
+        end
+        r = cand(q);
+        hSel = plot(axW(p), SER(r).x, SER(r).z, 'k-', 'LineWidth', 4); drawnow;
+
+        if TB.ManualExcluded(r), stateTxt = 'excluded by hand';
+        elseif isempty(TB.Excluded{r}), stateTxt = 'kept';
+        else, stateTxt = ['excluded: ' TB.Excluded{r}]; end
+        opts = [arrayfun(@(k) sprintf('%s (%g deg)', pos9{k}, angleOf(k)), 1:9, 'UniformOutput', false), ...
+            {'EXCLUDE ENTIRELY', sprintf('restore original (%s, no manual changes)', TB.OrigPosition{r}), 'cancel'}];
+        sel = listdlg('PromptString', {trial_label(TB, r), sprintf('labelled %s, shown under %s, %s.', TB.OrigPosition{r}, TB.Position{r}, ...
+            stateTxt), 'New angle, or exclude:'}, 'SelectionMode', 'single', 'ListString', opts, ...
+            'ListSize', [320 250]);
+        delete(hSel);
+        if isempty(sel) || sel == numel(opts), continue; end
+        if sel == 10
+            TB.ManualExcluded(r) = true;
+            TB.Excluded{r} = 'manually excluded';
+            TB = derive_columns(TB, includeRejected);
+            fprintf('  %s: excluded entirely\n', trial_label(TB, r));
+            RC = RC(~(RC.Block == TB.Block(r) & RC.TrialNum == TB.TrialNum(r) & RC.Attempt == TB.Attempt(r)), :);
+            RC = [RC; cell2table({TB.Block(r), TB.TrialNum(r), TB.Attempt(r), TB.OrigPosition{r}, ...
+                TB.OrigAngle(r), TB.Position{r}, TB.Angle(r), 'exclude', ...
+                char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm'))}, ...
+                'VariableNames', RC.Properties.VariableNames)];
+            writetable(RC, reclassFile);
+            axW = draw_walk_patterns(fW, TB, SER, P, roomLim);
+            drawnow;
+            continue
+        end
+        if sel == 11, newPos = TB.OrigPosition{r}; newAng = TB.OrigAngle(r);
+        else, newPos = pos9{sel}; newAng = angleOf(sel); end
+        TB.ManualExcluded(r) = ismember(TB.TrialNum(r), manualExclude);
+
+        E = walking_period(RAW{r}, newAng, P);
+        TB.Position{r} = newPos;  TB.Angle(r) = newAng;
+        TB.Reclassified(r) = ~strcmp(newPos, TB.OrigPosition{r});
+        TB.StartsAtTraceStart(r) = E.startsAtTraceStart;
+        TB.behWalkStart(r) = E.walkStart;  TB.behWalkEnd(r) = E.walkEnd;
+        TB.WalkDur(r) = E.walkEnd - E.walkStart;
+        TB.Excluded{r} = E.excluded;
+        if TB.ManualExcluded(r), TB.Excluded{r} = 'manually excluded'; end
+        SER(r).ia = E.ia;  SER(r).ic = E.ic;
+        TB = derive_columns(TB, includeRejected);
+        if isempty(E.excluded)
+            fprintf('  %s -> %s: walk kept, walking period %.2f s (one epoch)\n', trial_label(TB, r), ...
+                newPos, TB.WalkDur(r));
+        else
+            fprintf('  %s -> %s: still excluded (%s)\n', trial_label(TB, r), newPos, E.excluded);
+        end
+
+        RC = RC(~(RC.Block == TB.Block(r) & RC.TrialNum == TB.TrialNum(r) & RC.Attempt == TB.Attempt(r)), :);
+        if TB.Reclassified(r)
+            RC = [RC; cell2table({TB.Block(r), TB.TrialNum(r), TB.Attempt(r), TB.OrigPosition{r}, ...
+                TB.OrigAngle(r), newPos, newAng, 'reclassify', ...
+                char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm'))}, ...
+                'VariableNames', RC.Properties.VariableNames)];
+        end
+        writetable(RC, reclassFile);
+
+        axW = draw_walk_patterns(fW, TB, SER, P, roomLim);
+        drawnow;
+    end
+end
+isRej = strcmp(TB.TrialStatus, 'REJECTED');
+print_summary(TB);
+
+fF = draw_final_figure(TB, SER, P);
+exportgraphics(fF, fullfile(outDir, 'walks_final_p001.png'), 'Resolution', 300);
+exportgraphics(fF, fullfile(outDir, 'walks_final_p001.pdf'), 'ContentType', 'vector');
+
+if askBeforeEpoching
+    reply = input('\nWalk patterns shown. Continue to MEG epoching (part 2)? [y/n]: ', 's');
+    if ~strcmpi(strtrim(reply), 'y')
+        fprintf('Stopped after the behavioural output. Run again and answer y to make the epochs.\n');
+        return
+    end
+end
+
+if isempty(which('spm'))
+    error('SPM is not on the MATLAB path: addpath(''<your spm folder>'') and run again.');
+end
+spm('defaults', 'eeg');
+if isempty(which('ft_warning'))
+    addpath(fullfile(spm('Dir'), 'external', 'fieldtrip'));
+    ft_defaults;
+end
+
+TB.megClose = nan(height(TB), 1);
+M = struct('block', {}, 'file', {}, 'fs', {}, 'tZero', {});
+for b = 1:numel(blocks)
+    f = fullfile(megDir, sprintf(megFile, blocks(b)));
+    D = spm_eeg_load(f);
+    fs = D.fsample;
+
+    syncData = D(D.indchannel(cfg.sync_trigger_channels), :, 1);
+    [tZero, abortMarks] = detect_sync(syncData, cfg.sync_thresh, cfg.simultaneous_tol);
+    if isempty(tZero), error('Block %d: no sync pulse found on the trigger channels.', blocks(b)); end
+
+    condData = D(D.indchannel(cfg.trigger_channels), :, 1);
+    on = cell(1, numel(cfg.trigger_channels));
+    for c = 1:numel(cfg.trigger_channels)
+        e = find(diff(condData(c, :) > cfg.sync_thresh) == 1) + 1;
+        e = e(~any(abs(e(:) - abortMarks(:)') <= cfg.simultaneous_tol, 2));
+        on{c} = e(:);
+    end
+    closeOn = on{strcmp(cfg.cond_labels, 'Close Eyes')};
+    openOn  = on{strcmp(cfg.cond_labels, 'Open Eyes')};
+
+    isPause = false(size(closeOn)); usedOpen = false(size(openOn));
+    for k = 1:numel(closeOn)
+        m = find(~usedOpen & abs(openOn - closeOn(k)) <= cfg.simultaneous_tol, 1);
+        if ~isempty(m), isPause(k) = true; usedOpen(m) = true; end
+    end
+    closeOn = closeOn(~isPause); openOn = openOn(~usedOpen);
+
+    rows = find(TB.Block == blocks(b));
+    isAb = strcmp(TB.Status(rows), 'Aborted_Mid_Trial');
+    if numel(closeOn) ~= numel(rows) || numel(openOn) ~= sum(~isAb)
+        error(['Block %d: trigger counts do not match the behavioural attempts ', ...
+            '(expected %d Close Eyes and %d Open Eyes).'], blocks(b), numel(rows), sum(~isAb));
+    end
+    TB.megClose(rows) = closeOn;
+    M(end + 1) = struct('block', blocks(b), 'file', f, 'fs', fs, 'tZero', tZero);
+end
+
+dCE = TB.behCloseEyes - TB.behCloseStart;
+closeOffset_s = median(dCE(dCE <= min(dCE) + 0.1), 'omitnan');
+behCloseTrig = TB.behCloseEyes - closeOffset_s;
+fit = struct('block', {}, 'a', {}, 'b', {});
+for mm = 1:numel(M)
+    all_ = find(TB.Block == M(mm).block);
+    ok   = ~isnan(behCloseTrig(all_));
+    coef = [ones(sum(ok), 1), behCloseTrig(all_(ok))] \ TB.megClose(all_(ok));
+    fit(mm) = struct('block', M(mm).block, 'a', coef(1), 'b', coef(2));
+end
+
+% one epoch per walk, covering the whole walking period (walkStart to walkEnd), so epochs differ in length
+keep = find(TB.Use & TB.nEpochs > 0);
+rowsL = [];
+for r = keep'
+    mm  = find([M.block] == TB.Block(r));
+    fs  = M(mm).fs;
+    map = @(t) fit(mm).a + fit(mm).b * t;
+    beg = round(map(TB.behWalkStart(r)));
+    fin = round(map(TB.behWalkEnd(r)));
+    x = struct('EpochLen', (fin - beg + 1) / fs, 'WalkDur', TB.WalkDur(r), 'Block', TB.Block(r), 'File', M(mm).file, ...
+        'TrialNum', TB.TrialNum(r), 'Attempt', TB.Attempt(r), 'TrialStatus', TB.TrialStatus{r}, ...
+        'Position', TB.Position{r}, 'Angle', TB.Angle(r), ...
+        'OrigPosition', TB.OrigPosition{r}, 'Reclassified', TB.Reclassified(r), ...
+        'DistCode', TB.DistCode{r}, 'Epoch', 1, 'nEpochsInWalk', 1, ...
+        'behStart_s', TB.behWalkStart(r) - TB.behSetupStart(r), 'behEnd_s', TB.behWalkEnd(r) - TB.behSetupStart(r), ...
+        'begsample', beg, 'endsample', fin, 'nSamples', fin - beg + 1, ...
+        'timeRelSyncStart_s', (beg - M(mm).tZero) / fs);
+    rowsL = [rowsL; x];
+end
+
+EP = struct();
+EP.full = struct2table(rowsL);
+EP.note = ['One epoch per walk covering the whole walking period, so EpochLen / nSamples differ between epochs; ', ...
+    'behStart_s / behEnd_s are seconds from the start of the StartPos trace; ', ...
+    'begsample / endsample index the continuous file in File; ', ...
+    'timeRelSyncStart_s is the epoch start relative to the sync pulse (t_zero), as timeRelSec.'];
+save(fullfile(outDir, 'walk_epochs_full_p001.mat'), 'EP');
+writetable(struct2table(rowsL), fullfile(outDir, 'walk_epochs_full_p001.csv'));
+len = [rowsL.EpochLen];
+fprintf('\nEpoching file saved: %d epochs, one per walk, %.2f-%.2f s long (median %.2f s) (walk_epochs_full_p001.mat / .csv).\n', ...
+    numel(rowsL), min(len), max(len), median(len));
+
+function fF = draw_final_figure(TB, SER, P)
+pos9 = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
+cols = [0.031 0.188 0.420; 0.129 0.400 0.675; 0.263 0.576 0.765; 0.553 0.722 0.847; 0.302 0.302 0.302; ...
+        0.910 0.627 0.498; 0.839 0.376 0.302; 0.698 0.094 0.169; 0.404 0.000 0.122];
+fF = figure('Color', 'w', 'Position', [100 100 700 600]);
+ax = axes(fF); hold(ax, 'on');
+for k = 1:9
+    kp = find(TB.Use & strcmp(TB.Position, pos9{k}));
+    ends = nan(numel(kp), 2);
+    for n = 1:numel(kp)
+        S = SER(kp(n));
+        w = S.ia:S.ic;
+        plot(ax, S.x(w), S.z(w), '-', 'Color', [cols(k, :) 0.9], 'LineWidth', 2.2);   % whole walking period = the epoch
+        ends(n, :) = [S.x(S.ic), S.z(S.ic)];
+    end
+    if isempty(kp), continue; end
+    e = median(ends, 1); e = e / norm(e) * (norm(e) + 0.22);
+    a = TB.Angle(kp(1));
+    if a == 0, lab = sprintf('0%s', char(176)); else, lab = sprintf('%+g%s', a, char(176)); end
+    text(ax, e(1), e(2), lab, 'Color', cols(k, :) * 0.9, 'FontSize', 11, 'HorizontalAlignment', 'center');
+end
+plot(ax, 0, 0, 'p', 'MarkerSize', 15, 'MarkerFaceColor', 'k', 'MarkerEdgeColor', 'k');
+set(ax, 'XDir', 'reverse', 'Box', 'off', 'TickDir', 'out', 'FontSize', 11);
+axis(ax, 'equal'); xlim(ax, [-1.9 1.9]); ylim(ax, [-2.05 0.45]);
+xlabel(ax, 'x (m)'); ylabel(ax, 'z (m)');
+end
+
+function txt = trial_label(TB, r)
+if sum(TB.TrialNum == TB.TrialNum(r)) > 1
+    txt = sprintf('Trial %d (attempt %d)', TB.TrialNum(r), TB.Attempt(r));
+else
+    txt = sprintf('Trial %d', TB.TrialNum(r));
+end
+end
+
+function RC = load_reclass(f)
+vars = {'Block', 'TrialNum', 'Attempt', 'OrigPosition', 'OrigAngle', 'NewPosition', 'NewAngle', 'Action', 'Saved'};
+if exist(f, 'file')
+    RC = readtable(f, 'TextType', 'char', 'Delimiter', ',');
+    if ~ismember('Action', RC.Properties.VariableNames)
+        RC.Action = repmat({'reclassify'}, height(RC), 1);
+    end
+    for v = {'OrigPosition', 'NewPosition', 'Action', 'Saved'}
+        if ~iscell(RC.(v{1})), RC.(v{1}) = cellstr(string(RC.(v{1}))); end
+    end
+    RC = RC(:, vars);
+else
+    RC = cell2table(cell(0, numel(vars)), 'VariableNames', vars);
+    RC.Block = zeros(0, 1); RC.TrialNum = zeros(0, 1); RC.Attempt = zeros(0, 1);
+    RC.OrigAngle = zeros(0, 1); RC.NewAngle = zeros(0, 1);
+end
+end
+
+function TB = derive_columns(TB, includeRejected)
+isRej  = strcmp(TB.TrialStatus, 'REJECTED');
+walkOK = cellfun(@isempty, TB.Excluded);
+TB.Use = walkOK & (~isRej | includeRejected);
+TB.nEpochs = double(walkOK & isfinite(TB.WalkDur) & TB.WalkDur > 0);   % one epoch per walk: the whole walking period
+end
+
+function print_summary(TB)
+pos9   = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
+dcList = {'D1', 'D2', 'D3'};
+deg    = @(a) strrep(sprintf('%+g%s', a, char(176)), '+0', '0');
+rc = find(TB.Reclassified & cellfun(@isempty, TB.Excluded));
+fprintf('\nReclassified walks (new angle):\n');
+if isempty(rc), fprintf('   none\n'); end
+for r = rc'
+    fprintf('   %-24s %s (%s) -> %s (%s)\n', trial_label(TB, r), TB.OrigPosition{r}, ...
+        deg(TB.OrigAngle(r)), TB.Position{r}, deg(TB.Angle(r)));
+end
+kept = find(TB.Use);
+fprintf('\nWalking periods available (one epoch per walk = the whole walking period):\n');
+fprintf('   %-4s %6s %-3s | %5s %10s %15s %9s\n', 'Pos', 'angle', 'D', 'walks', 'median (s)', 'range (s)', 'total (s)');
+for p = 1:9
+    for d = 1:3
+        k = kept(strcmp(TB.Position(kept), pos9{p}) & strcmp(TB.DistCode(kept), dcList{d}));
+        if isempty(k), continue; end
+        fprintf('   %-4s %6s %-3s | %5d %10.2f %6.2f - %6.2f %9.1f\n', pos9{p}, deg(TB.Angle(k(1))), dcList{d}, ...
+            numel(k), median(TB.WalkDur(k)), min(TB.WalkDur(k)), max(TB.WalkDur(k)), sum(TB.WalkDur(k)));
+    end
+end
+fprintf('   Total: %d walks = %d epochs, %.1f s of walking (median %.2f s, range %.2f - %.2f s)\n', numel(kept), ...
+    sum(TB.nEpochs(kept)), sum(TB.WalkDur(kept)), median(TB.WalkDur(kept)), min(TB.WalkDur(kept)), max(TB.WalkDur(kept)));
+end
+
+function axW = draw_walk_patterns(fW, TB, SER, P, roomLim)
+clf(fW);
+pos9   = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
+dcList = {'D1', 'D2', 'D3'};
+dCol   = [0.11 0.62 0.47; 0.85 0.37 0.01; 0.46 0.44 0.70];
+red    = [0.85 0 0];  mag = [0.80 0 0.80];
+isRej  = strcmp(TB.TrialStatus, 'REJECTED');
+walkOK = cellfun(@isempty, TB.Excluded);
+kept   = find(TB.Use);
+tlW = tiledlayout(fW, 3, 3, 'TileSpacing', 'compact');
+axW = gobjects(1, 9);
+for p = 1:9
+    axW(p) = nexttile(tlW); hold on; box on; axis equal;
+    kp = kept(strcmp(TB.Position(kept), pos9{p}));
+    for r = kp'
+        c = dCol(strcmp(dcList, TB.DistCode{r}), :);
+        ls = '-'; if isRej(r), ls = '--'; end
+        S = SER(r); X = S.x; Y = S.z;
+        if TB.Reclassified(r), plot(X, Y, '-', 'Color', mag, 'LineWidth', 1.5);
+        else, plot(X, Y, '-', 'Color', [0.82 0.82 0.82], 'LineWidth', 1); end
+        plot(X(S.ia:S.ic), Y(S.ia:S.ic), ls, 'Color', c, 'LineWidth', 3.5);       % whole walking period = the epoch
+        plot(X(S.ia), Y(S.ia), 'o', 'MarkerFaceColor', c, 'MarkerEdgeColor', 'k', 'MarkerSize', 6);
+        plot(X(S.ic), Y(S.ic), 's', 'MarkerFaceColor', 'w', 'MarkerEdgeColor', c, 'MarkerSize', 6, 'LineWidth', 1.5);
+    end
+    km = find(TB.ManualExcluded & strcmp(TB.Position, pos9{p}));
+    labsM = {};
+    for r = km'
+        S = SER(r);
+        labsM{end + 1} = ['excluded by hand: ' trial_label(TB, r)];
+        if isempty(S.x), continue; end
+        plot(S.x, S.z, ':', 'Color', [0 0 0], 'LineWidth', 2);
+        plot(S.x(end), S.z(end), 'x', 'Color', [0 0 0], 'MarkerSize', 9, 'LineWidth', 2);
+    end
+    if ~isempty(labsM)
+        text(0.98, 0.97, strjoin(labsM, newline), 'Units', 'normalized', 'Color', [0 0 0], 'FontSize', 8, ...
+            'FontWeight', 'bold', 'HorizontalAlignment', 'right', 'VerticalAlignment', 'top');
+    end
+    kx = find(~walkOK & ~TB.ManualExcluded & strcmp(TB.Position, pos9{p}));
+    labs = {};
+    for r = kx'
+        S = SER(r);
+        labs{end + 1} = ['excluded: ' trial_label(TB, r)];
+        if isempty(S.x), continue; end
+        plot(S.x, S.z, '-', 'Color', red, 'LineWidth', 2);
+        plot(S.x(end), S.z(end), 'x', 'Color', red, 'MarkerSize', 9, 'LineWidth', 2);
+    end
+    kr = find(TB.Reclassified & walkOK & strcmp(TB.Position, pos9{p}));
+    labsR = arrayfun(@(r) sprintf('reclassified: %s (from %s)', trial_label(TB, r), TB.OrigPosition{r}), ...
+        kr, 'UniformOutput', false);
+    if ~isempty(labs)
+        text(0.98, 0.03, strjoin(labs, newline), 'Units', 'normalized', 'Color', red, 'FontSize', 8, ...
+            'FontWeight', 'bold', 'HorizontalAlignment', 'right', 'VerticalAlignment', 'bottom');
+    end
+    if ~isempty(labsR)
+        text(0.02, 0.03, strjoin(labsR, newline), 'Units', 'normalized', 'Color', mag, 'FontSize', 8, ...
+            'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'VerticalAlignment', 'bottom');
+    end
+    plot(0, 0, 'k*', 'MarkerSize', 14, 'LineWidth', 1.5);
+    set(gca, 'XDir', 'reverse'); grid on; xlim(roomLim); ylim(roomLim);
+    angP = TB.OrigAngle(find(strcmp(TB.OrigPosition, pos9{p}), 1));
+    title(sprintf('%s (%g%s): %d walks (%d rej.), median %.1f s, %d excluded', pos9{p}, angP, char(176), ...
+        numel(kp), sum(isRej(kp)), median(TB.WalkDur(kp)), numel(kx) + numel(km)));
+    if mod(p - 1, 3) == 0, ylabel('Room Z Position (Meters)'); end
+    if p > 6, xlabel('Room X Position (Meters)'); end
+end
+hL = gobjects(1, 11);
+for d = 1:3, hL(d) = plot(axW(1), NaN, NaN, '-', 'Color', dCol(d, :), 'LineWidth', 3.5); end
+hL(4)  = plot(axW(1), NaN, NaN, '-', 'Color', [0.4 0.4 0.4], 'LineWidth', 3.5);
+hL(5)  = plot(axW(1), NaN, NaN, 'o', 'MarkerFaceColor', [0.4 0.4 0.4], 'MarkerEdgeColor', 'k', 'MarkerSize', 6);
+hL(6)  = plot(axW(1), NaN, NaN, '-', 'Color', [0.82 0.82 0.82], 'LineWidth', 1);
+hL(7)  = plot(axW(1), NaN, NaN, '--', 'Color', [0.4 0.4 0.4], 'LineWidth', 2);
+hL(8)  = plot(axW(1), NaN, NaN, '-', 'Color', red, 'LineWidth', 2);
+hL(9)  = plot(axW(1), NaN, NaN, ':', 'Color', [0 0 0], 'LineWidth', 2);
+hL(10) = plot(axW(1), NaN, NaN, '-', 'Color', mag, 'LineWidth', 1.5);
+hL(11) = plot(axW(1), NaN, NaN, 'k*', 'MarkerSize', 10, 'LineWidth', 1.5);
+lg = legend(axW(1), hL, {'D1 (1.00 m)', 'D2 (1.25 m)', 'D3 (1.50 m)', 'walking period (= epoch)', ...
+    'walk start (square = end)', 'whole trace', 'rejected attempt', 'excluded (walk criteria)', ...
+    'excluded by hand', 'reclassified', 'room centre'}, ...
+    'Orientation', 'horizontal', 'NumColumns', 6, 'FontSize', 9);
+lg.Layout.Tile = 'south';
+end
+
+function tr = get_trace(traces, name)
+tr = [];
+if isfield(traces, name), tr = traces.(name); end
+end
+
+function t = first_time(tr)
+t = NaN;
+if ~isempty(tr) && isfield(tr, 'time') && ~isempty(tr.time), t = min(double(tr.time(:))); end
+end
+
+function t = last_time(tr)
+t = NaN;
+if ~isempty(tr) && isfield(tr, 'time') && ~isempty(tr.time), t = max(double(tr.time(:))); end
+end
+
+function E = walking_period(tr, label, P)
+E = struct('walkStart', NaN, 'walkEnd', NaN, 'excluded', 'no walk recording', ...
+    'tRel', [], 'speed', [], 'x', [], 'z', [], 'ia', NaN, 'ic', NaN, 'startsAtTraceStart', false);
+if isempty(tr) || ~isfield(tr, 'time') || numel(tr.time) < 2, return; end
+t = double(tr.time(:)); x = double(tr.x(:)); z = double(tr.z(:));
+ok = ~isnan(t) & ~isnan(x) & ~isnan(z);
+[t, iu] = unique(t(ok)); x = x(ok); z = z(ok); x = x(iu); z = z(iu);
+if numel(t) < 2, return; end
+fs = P.fs;
+tu = (t(1):1/fs:t(end))';
+xs = movmean(interp1(t, x, tu), round(P.smoothWin * fs));
+zs = movmean(interp1(t, z, tu), round(P.smoothWin * fs));
+vx = gradient(xs, 1 / fs); vz = gradient(zs, 1 / fs);
+spd = hypot(vx, vz);
+E.tRel = (tu - tu(1))'; E.speed = spd'; E.x = xs'; E.z = zs';
+wd = round(P.dirWin * fs);
+dirErr = mod(atan2d(movmean(vx, wd), -movmean(vz, wd)) - label + 180, 360) - 180;
+steady = spd > P.speedThr & abs(dirErr) <= P.dirTol;
+steady = bridge_gaps(steady, round(P.bridge * fs));
+[len, i1, i2] = longest_run(steady);
+if len == 0, E.excluded = 'no steady walk'; return; end
+if (i2 - i1) / fs - 2 * P.trim < P.chunk
+    E.excluded = 'steady walk < 1 s after trimming'; return
+end
+endAngle = atan2d(x(end), -z(end));
+if abs(mod(endAngle - label + 180, 360) - 180) > P.endTol
+    E.excluded = sprintf('ends > %g deg from start position', P.endTol); return
+end
+thr = P.plateauFrac * median(spd(i1:i2));
+a = i1; while a > 1 && spd(a - 1) > thr, a = a - 1; end
+c = i2; while c < numel(spd) && spd(c + 1) > thr, c = c + 1; end
+E.walkStart = tu(a);
+E.walkEnd   = tu(c);
+E.ia = a; E.ic = c;
+E.startsAtTraceStart = (a == 1);
+E.excluded  = '';
+end
+
+function s = bridge_gaps(s, maxGap)
+s = s(:)';
+d = diff([1 s 1]);
+gS = find(d == -1); gE = find(d == 1) - 1;
+for k = 1:numel(gS)
+    if gS(k) > 1 && gE(k) < numel(s) && (gE(k) - gS(k) + 1) < maxGap, s(gS(k):gE(k)) = true; end
+end
+s = s(:);
+end
+
+function [len, i1, i2] = longest_run(s)
+s = s(:)';
+d = diff([0 s 0]);
+st = find(d == 1); en = find(d == -1) - 1;
+if isempty(st), len = 0; i1 = NaN; i2 = NaN; return; end
+[len, k] = max(en - st + 1);
+i1 = st(k); i2 = en(k);
+end
+
+function [tZero, abortMarks] = detect_sync(trig, thresh, tol)
+edges = [];
+for c = 1:size(trig, 1)
+    on = find(diff(trig(c, :) > thresh) == 1) + 1;
+    edges = [edges; on(:), repmat(c, numel(on), 1)];
+end
+tZero = []; abortMarks = [];
+if isempty(edges), return; end
+edges = sortrows(edges, 1);
+rise = [];
+i = 1;
+while i <= size(edges, 1)
+    j = i;
+    while j < size(edges, 1) && edges(j + 1, 1) - edges(i, 1) <= tol, j = j + 1; end
+    if numel(unique(edges(i:j, 2))) >= size(trig, 1), rise(end + 1) = round(mean(edges(i:j, 1))); end
+    i = j + 1;
+end
+if isempty(rise), return; end
+tZero = rise(1);
+abortMarks = rise(2:end);
+end
