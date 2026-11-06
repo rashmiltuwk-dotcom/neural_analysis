@@ -9,6 +9,7 @@ outDir  = fullfile(behDir, '..', 'results', 'p001');
 cfg = config();   % config.m must be on the MATLAB path
 
 askBeforeEpoching = true;
+epochMode = '';   % '' = ask at the start of each run; or 'first3' / 'full' / 'stableyaw' to skip the question
 includeRejected   = true;
 roomLim   = [-2 2];
 reclassifyInteractive = true;
@@ -21,8 +22,26 @@ P.bridge = 0.3; P.trim = 0.5; P.chunk = 1.0; P.endTol = 45;
 P.plateauFrac = 0.5;
 P.hold = 0.25;     % yaw: runs of identical tracker frames lasting >= this (s) count as frozen and are left out
 P.minLive = 0.5;   % yaw: at least this many seconds of live frames inside the walking period, else NaN
+P.epochLen  = 3;     % 'first3': epoch length (s) from the start of the walking period
+P.yawBand   = 15;    % 'stableyaw': longest stretch of the walking period where torso yaw stays within this many deg
+P.yawSmooth = 0.5;   % 'stableyaw': s, moving mean on torso yaw before finding that stretch
 
 if ~exist(outDir, 'dir'), mkdir(outDir); end
+
+% ---- how the walks are epoched: decides every behavioural figure and summary below ----
+modes = {'first3', 'full', 'stableyaw'};
+modeTxt = {sprintf('Velocity: first %g s of the walking period (same length for every walk)', P.epochLen), ...
+    'Velocity: the full walking period (length differs between walks)', ...
+    sprintf('Stable yaw: the part of the walking period where torso yaw stays within %g%s', P.yawBand, char(176))};
+if isempty(epochMode)
+    sel = listdlg('PromptString', {'How should the walks be epoched?', ''}, 'SelectionMode', 'single', ...
+        'ListString', modeTxt, 'ListSize', [520 90], 'InitialValue', 2, 'Name', 'Epoching');
+    if isempty(sel), fprintf('No epoching option chosen; stopped.\n'); return; end
+    epochMode = modes{sel};
+end
+if ~ismember(epochMode, modes), error('epochMode must be one of: %s', strjoin(modes, ', ')); end
+modeLabel = modeTxt{strcmp(modes, epochMode)};
+fprintf('Epoching: %s\n', modeLabel);
 
 files  = dir(fullfile(behDir, cfg.master_data_pattern));
 namePattern = '^[Pp](?:articipant)?[_\- ]?(\d+)[_\- ](\d+)(?:[_\- ]|$)';
@@ -80,6 +99,7 @@ for b = 1:numel(files)
         r.behOpenEyes   = min(oe);
 
         E = walking_period(sp, r.Angle, P);
+        E = apply_epoch_mode(E, sp, epochMode, P);   % behWalkStart/End below = this walk's epoch window
         RAW{numel(B) + 1} = sp;
         SER(numel(B) + 1) = struct('t', E.tRel, 'speed', E.speed, 'x', E.x, 'z', E.z, ...
             'ia', E.ia, 'ic', E.ic);
@@ -87,6 +107,10 @@ for b = 1:numel(files)
         r.behWalkStart = E.walkStart;
         r.behWalkEnd   = E.walkEnd;
         r.WalkDur      = E.walkEnd - E.walkStart;
+        r.FullWalkStart = E.fullStart;   % the whole speed-based walking period, for reference
+        r.FullWalkEnd   = E.fullEnd;
+        r.FullWalkDur   = E.fullEnd - E.fullStart;
+        r.SteadyDur    = E.steadyEnd - E.steadyStart;
         hd = get_trace(MD(i).Traces, 'StartPosHeadTrace');
         RAWH{numel(B) + 1} = hd;
         r.HeadMeanYaw  = mean_yaw(hd, E.walkStart, E.walkEnd, P);   % over this walk's walking period only
@@ -154,7 +178,7 @@ if reclassifyInteractive
                 TB.OrigAngle(r), TB.Position{r}, TB.Angle(r), 'exclude', ...
                 char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm'))}, ...
                 'VariableNames', RC.Properties.VariableNames)];
-            writetable(RC, reclassFile);
+            save_reclass(RC, reclassFile);
             axW = draw_walk_patterns(fW, TB, SER, P, roomLim);
             drawnow;
             continue
@@ -164,11 +188,15 @@ if reclassifyInteractive
         TB.ManualExcluded(r) = ismember(TB.TrialNum(r), manualExclude);
 
         E = walking_period(RAW{r}, newAng, P);
+        E = apply_epoch_mode(E, RAW{r}, epochMode, P);
+        TB.FullWalkStart(r) = E.fullStart;  TB.FullWalkEnd(r) = E.fullEnd;
+        TB.FullWalkDur(r) = E.fullEnd - E.fullStart;
         TB.Position{r} = newPos;  TB.Angle(r) = newAng;
         TB.Reclassified(r) = ~strcmp(newPos, TB.OrigPosition{r});
         TB.StartsAtTraceStart(r) = E.startsAtTraceStart;
         TB.behWalkStart(r) = E.walkStart;  TB.behWalkEnd(r) = E.walkEnd;
         TB.WalkDur(r) = E.walkEnd - E.walkStart;
+        TB.SteadyDur(r) = E.steadyEnd - E.steadyStart;
         TB.HeadMeanYaw(r)  = mean_yaw(RAWH{r}, E.walkStart, E.walkEnd, P);   % new walking period -> recompute yaw
         TB.TorsoMeanYaw(r) = mean_yaw(RAW{r}, E.walkStart, E.walkEnd, P);
         TB.Excluded{r} = E.excluded;
@@ -189,18 +217,31 @@ if reclassifyInteractive
                 char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm'))}, ...
                 'VariableNames', RC.Properties.VariableNames)];
         end
-        writetable(RC, reclassFile);
+        save_reclass(RC, reclassFile);
 
         axW = draw_walk_patterns(fW, TB, SER, P, roomLim);
         drawnow;
     end
 end
 isRej = strcmp(TB.TrialStatus, 'REJECTED');
-print_summary(TB);
+print_summary(TB, modeLabel);
+
+fprintf('\nAngle-specific (steady) part vs full walking period, kept walks:\n');
+fprintf('   %-4s %6s | %5s %10s %12s %10s %8s\n', 'Pos', 'angle', 'walks', 'full (s)', 'steady (s)', 'cut (s)', 'kept %');
+for p = 1:9
+    k = TB.Use & strcmp(TB.Position, pos9{p});
+    if ~any(k), continue; end
+    f = TB.FullWalkDur(k); s = TB.SteadyDur(k);
+    fprintf('   %-4s %+5g%s | %5d %10.2f %12.2f %10.2f %7.0f%%\n', pos9{p}, angleOf(p), char(176), nnz(k), ...
+        median(f), median(s), median(f - s), 100 * median(s ./ f));
+end
+f = TB.FullWalkDur(TB.Use); s = TB.SteadyDur(TB.Use);
+fprintf('   All: full %.2f s, steady %.2f s, cut %.2f s (medians), %.0f%% kept\n', ...
+    median(f), median(s), median(f - s), 100 * median(s ./ f));
 
 fF = draw_final_figure(TB, SER, P);
-exportgraphics(fF, fullfile(outDir, 'walks_final_p001.png'), 'Resolution', 300);
-exportgraphics(fF, fullfile(outDir, 'walks_final_p001.pdf'), 'ContentType', 'vector');
+safe_write(fullfile(outDir, sprintf('walks_final_%s_p001.png', epochMode)), @(f) exportgraphics(fF, f, 'Resolution', 300));
+safe_write(fullfile(outDir, sprintf('walks_final_%s_p001.pdf', epochMode)), @(f) exportgraphics(fF, f, 'ContentType', 'vector'));
 
 if askBeforeEpoching
     reply = input('\nWalk patterns shown. Continue to MEG epoching (part 2)? [y/n]: ', 's');
@@ -268,7 +309,7 @@ for mm = 1:numel(M)
     fit(mm) = struct('block', M(mm).block, 'a', coef(1), 'b', coef(2));
 end
 
-% one epoch per walk, covering the whole walking period (walkStart to walkEnd), so epochs differ in length
+% one epoch per walk: behWalkStart-behWalkEnd, which is already the window for the chosen epochMode
 keep = find(TB.Use & TB.nEpochs > 0);
 rowsL = [];
 for r = keep'
@@ -277,31 +318,37 @@ for r = keep'
     map = @(t) fit(mm).a + fit(mm).b * t;
     beg = round(map(TB.behWalkStart(r)));
     fin = round(map(TB.behWalkEnd(r)));
-    x = struct('EpochLen', (fin - beg + 1) / fs, 'WalkDur', TB.WalkDur(r), 'Block', TB.Block(r), 'File', M(mm).file, ...
+    if strcmp(epochMode, 'first3'), fin = beg + round(P.epochLen * fs) - 1; end   % exactly the same length for every walk
+    x = struct('EpochMode', epochMode, 'EpochLen', (fin - beg + 1) / fs, 'WalkDur', TB.WalkDur(r), ...
+        'FullWalkDur', TB.FullWalkDur(r), 'Block', TB.Block(r), 'File', M(mm).file, ...
         'TrialNum', TB.TrialNum(r), 'Attempt', TB.Attempt(r), 'TrialStatus', TB.TrialStatus{r}, ...
         'Position', TB.Position{r}, 'Angle', TB.Angle(r), ...
         'HeadMeanYaw', TB.HeadMeanYaw(r), 'TorsoMeanYaw', TB.TorsoMeanYaw(r), ...
         'OrigPosition', TB.OrigPosition{r}, 'Reclassified', TB.Reclassified(r), ...
         'DistCode', TB.DistCode{r}, 'Epoch', 1, 'nEpochsInWalk', 1, ...
         'behStart_s', TB.behWalkStart(r) - TB.behSetupStart(r), 'behEnd_s', TB.behWalkEnd(r) - TB.behSetupStart(r), ...
+        'fullWalkStart_s', TB.FullWalkStart(r) - TB.behSetupStart(r), 'fullWalkEnd_s', TB.FullWalkEnd(r) - TB.behSetupStart(r), ...
         'begsample', beg, 'endsample', fin, 'nSamples', fin - beg + 1, ...
         'timeRelSyncStart_s', (beg - M(mm).tZero) / fs);
     rowsL = [rowsL; x];
 end
 
 EP = struct();
-EP.full = struct2table(rowsL);
-EP.note = ['One epoch per walk covering the whole walking period, so EpochLen / nSamples differ between epochs; ', ...
+EP.mode = epochMode;
+EP.full = struct2table(rowsL);   % the epochs table (kept under this name for the scripts that read it)
+EP.note = [modeLabel, '; one epoch per walk; WalkDur = epoch window, FullWalkDur / fullWalkStart_s / fullWalkEnd_s = ', ...
+    'the whole speed-based walking period for reference; ', ...
     'behStart_s / behEnd_s are seconds from the start of the StartPos trace; ', ...
     'begsample / endsample index the continuous file in File; ', ...
     'timeRelSyncStart_s is the epoch start relative to the sync pulse (t_zero), as timeRelSec; ', ...
-    'HeadMeanYaw / TorsoMeanYaw are circular-mean yaw (deg, 0-360) over the same walking period, live tracker frames only ', ...
+    'HeadMeanYaw / TorsoMeanYaw are circular-mean yaw (deg, 0-360) over the epoch window, live tracker frames only ', ...
     '(frozen runs >= P.hold s left out; NaN if < P.minLive s of live frames).'];
-save(fullfile(outDir, 'walk_epochs_full_p001.mat'), 'EP');
-writetable(struct2table(rowsL), fullfile(outDir, 'walk_epochs_full_p001.csv'));
+outName = sprintf('walk_epochs_%s_p001', epochMode);   % walk_epochs_first3_p001 / _full_ / _stableyaw_
+fM = safe_write(fullfile(outDir, [outName '.mat']), @(f) save_ep(f, EP));
+fC = safe_write(fullfile(outDir, [outName '.csv']), @(f) writetable(struct2table(rowsL), f));
 len = [rowsL.EpochLen];
-fprintf('\nEpoching file saved: %d epochs, one per walk, %.2f-%.2f s long (median %.2f s) (walk_epochs_full_p001.mat / .csv).\n', ...
-    numel(rowsL), min(len), max(len), median(len));
+fprintf('\nEpoching file saved (%s): %d epochs, one per walk, %.2f-%.2f s long (mean %.2f, median %.2f s)\n   %s\n   %s\n', ...
+    epochMode, numel(rowsL), min(len), max(len), mean(len), median(len), fM, fC);
 
 function fF = draw_final_figure(TB, SER, P)
 pos9 = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
@@ -328,6 +375,93 @@ plot(ax, 0, 0, 'p', 'MarkerSize', 15, 'MarkerFaceColor', 'k', 'MarkerEdgeColor',
 set(ax, 'XDir', 'reverse', 'Box', 'off', 'TickDir', 'out', 'FontSize', 11);
 axis(ax, 'equal'); xlim(ax, [-1.9 1.9]); ylim(ax, [-2.05 0.45]);
 xlabel(ax, 'x (m)'); ylabel(ax, 'z (m)');
+end
+
+function E = apply_epoch_mode(E, tr, mode, P)
+% Turn the speed-based walking period into the epoch window for the chosen mode.
+% E.walkStart/E.walkEnd (and E.ia/E.ic, used by the figures) become the epoch window;
+% E.fullStart/E.fullEnd keep the whole walking period.
+E.fullStart = E.walkStart; E.fullEnd = E.walkEnd;
+if ~isempty(E.excluded), return; end
+switch mode
+    case 'first3'
+        if E.walkEnd - E.walkStart < P.epochLen
+            E.excluded = sprintf('walking period < %g s', P.epochLen); return
+        end
+        E.walkEnd = E.walkStart + P.epochLen;
+    case 'stableyaw'
+        [fa, fb] = flat_window(tr, E.walkStart, E.walkEnd, P);
+        if isnan(fa), E.excluded = 'no stable-yaw stretch'; return; end
+        E.walkStart = fa; E.walkEnd = fb;
+end
+ta = E.tRel + E.t0;
+ia = find(ta >= E.walkStart - 1e-9, 1); ic = find(ta <= E.walkEnd + 1e-9, 1, 'last');
+if ~isempty(ia) && ~isempty(ic), E.ia = ia; E.ic = ic; end
+E.startsAtTraceStart = (E.ia == 1);
+end
+
+function [fa, fb] = flat_window(tr, a, b, P)
+% Longest stretch inside a-b (trace clock) where torso yaw, unwrapped and smoothed over P.yawSmooth s,
+% stays within P.yawBand deg (max - min). Same rule as setup_walk_yaw.m.
+fa = NaN; fb = NaN;
+if isnan(a) || isnan(b) || isempty(tr) || ~isfield(tr, 'time') || ~isfield(tr, 'yaw') || numel(tr.time) < 2, return; end
+t = double(tr.time(:)); x = double(tr.x(:)); z = double(tr.z(:)); y = double(tr.yaw(:));
+ok = ~isnan(t) & ~isnan(x) & ~isnan(z) & ~isnan(y);
+t = t(ok); y = y(ok);
+[t, iu] = unique(t); y = y(iu);
+if numel(t) < 2, return; end
+tq = (t(1):1 / P.fs:t(end))';
+ys = movmean(interp1(t, rad2deg(unwrap(deg2rad(y))), tq, 'linear'), round(P.yawSmooth * P.fs));
+idx = find(tq >= a & tq <= b);
+if numel(idx) < 2, return; end
+v = ys(idx); n = numel(v); best = -1;
+for i = 1:n
+    lo = v(i); hi = v(i); j = i;
+    while j < n && max(hi, v(j + 1)) - min(lo, v(j + 1)) <= P.yawBand
+        j = j + 1; lo = min(lo, v(j)); hi = max(hi, v(j));
+    end
+    if j - i > best, best = j - i; fa = tq(idx(i)); fb = tq(idx(j)); end
+end
+end
+
+function f = safe_write(f, writer)
+% Write with writer(f). If the file is locked (e.g. open in Excel or a PDF viewer),
+% save a timestamped copy next to it instead of stopping, and say so.
+try
+    writer(f);
+catch err
+    locked = contains(lower(err.message), {'permission', 'denied', 'unable to open', 'cannot open', ...
+        'could not open', 'cannot create', 'being used', 'in use'});
+    if ~locked, rethrow(err); end   % a real error, not a locked file: stop and show it
+    [d, n, e] = fileparts(f);
+    f2 = fullfile(d, sprintf('%s_%s%s', n, char(datetime('now', 'Format', 'yyyyMMdd_HHmmss')), e));
+    writer(f2);
+    warning('Could not write %s (%s)\n  -> saved as %s instead. Close the file in the other program to overwrite it next time.', ...
+        f, err.message, f2);
+    f = f2;
+end
+end
+
+function save_ep(f, EP) %#ok<INUSD> EP is saved by name
+save(f, 'EP');
+end
+
+function save_reclass(RC, f)
+% The reclassification file is read back on the next run, so it must keep its name:
+% if it is locked, ask for it to be closed and try again rather than saving a copy.
+while true
+    try
+        writetable(RC, f);
+        return
+    catch err
+        fprintf(2, '\nCould not save %s:\n  %s\n', f, err.message);
+        reply = input('Close it in the other program (e.g. Excel), then press Enter to retry, or type s to skip: ', 's');
+        if strcmpi(strtrim(reply), 's')
+            warning('Reclassification NOT saved this time; your changes will be lost when the script ends.');
+            return
+        end
+    end
+end
 end
 
 function txt = trial_label(TB, r)
@@ -363,7 +497,7 @@ TB.Use = walkOK & (~isRej | includeRejected);
 TB.nEpochs = double(walkOK & isfinite(TB.WalkDur) & TB.WalkDur > 0);   % one epoch per walk: the whole walking period
 end
 
-function print_summary(TB)
+function print_summary(TB, modeLabel)
 pos9   = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
 dcList = {'D1', 'D2', 'D3'};
 deg    = @(a) strrep(sprintf('%+g%s', a, char(176)), '+0', '0');
@@ -375,7 +509,7 @@ for r = rc'
         deg(TB.OrigAngle(r)), TB.Position{r}, deg(TB.Angle(r)));
 end
 kept = find(TB.Use);
-fprintf('\nWalking periods available (one epoch per walk = the whole walking period):\n');
+fprintf('\nEpochs available, one per walk (%s):\n', modeLabel);
 fprintf('   %-4s %6s %-3s | %5s %10s %15s %9s\n', 'Pos', 'angle', 'D', 'walks', 'median (s)', 'range (s)', 'total (s)');
 for p = 1:9
     for d = 1:3
@@ -387,6 +521,8 @@ for p = 1:9
 end
 fprintf('   Total: %d walks = %d epochs, %.1f s of walking (median %.2f s, range %.2f - %.2f s)\n', numel(kept), ...
     sum(TB.nEpochs(kept)), sum(TB.WalkDur(kept)), median(TB.WalkDur(kept)), min(TB.WalkDur(kept)), max(TB.WalkDur(kept)));
+fprintf('   (whole walking periods of the same walks: median %.2f s, %.1f s in total)\n', median(TB.FullWalkDur(kept)), ...
+    sum(TB.FullWalkDur(kept)));
 end
 
 function m = mean_yaw(tr, tA, tB, P)
@@ -492,7 +628,7 @@ hL(8)  = plot(axW(1), NaN, NaN, '-', 'Color', red, 'LineWidth', 2);
 hL(9)  = plot(axW(1), NaN, NaN, ':', 'Color', [0 0 0], 'LineWidth', 2);
 hL(10) = plot(axW(1), NaN, NaN, '-', 'Color', mag, 'LineWidth', 1.5);
 hL(11) = plot(axW(1), NaN, NaN, 'k*', 'MarkerSize', 10, 'LineWidth', 1.5);
-lg = legend(axW(1), hL, {'D1 (1.00 m)', 'D2 (1.25 m)', 'D3 (1.50 m)', 'walking period (= epoch)', ...
+lg = legend(axW(1), hL, {'D1 (1.00 m)', 'D2 (1.25 m)', 'D3 (1.50 m)', 'epoch window', ...
     'walk start (square = end)', 'whole trace', 'rejected attempt', 'excluded (walk criteria)', ...
     'excluded by hand', 'reclassified', 'room centre'}, ...
     'Orientation', 'horizontal', 'NumColumns', 6, 'FontSize', 9);
@@ -515,8 +651,8 @@ if ~isempty(tr) && isfield(tr, 'time') && ~isempty(tr.time), t = max(double(tr.t
 end
 
 function E = walking_period(tr, label, P)
-E = struct('walkStart', NaN, 'walkEnd', NaN, 'excluded', 'no walk recording', ...
-    'tRel', [], 'speed', [], 'x', [], 'z', [], 'ia', NaN, 'ic', NaN, 'startsAtTraceStart', false);
+E = struct('walkStart', NaN, 'walkEnd', NaN, 'steadyStart', NaN, 'steadyEnd', NaN, 'excluded', 'no walk recording', ...
+    'tRel', [], 'speed', [], 'x', [], 'z', [], 'ia', NaN, 'ic', NaN, 'startsAtTraceStart', false, 't0', NaN);
 if isempty(tr) || ~isfield(tr, 'time') || numel(tr.time) < 2, return; end
 t = double(tr.time(:)); x = double(tr.x(:)); z = double(tr.z(:));
 ok = ~isnan(t) & ~isnan(x) & ~isnan(z);
@@ -524,6 +660,7 @@ ok = ~isnan(t) & ~isnan(x) & ~isnan(z);
 if numel(t) < 2, return; end
 fs = P.fs;
 tu = (t(1):1/fs:t(end))';
+E.t0 = tu(1);
 xs = movmean(interp1(t, x, tu), round(P.smoothWin * fs));
 zs = movmean(interp1(t, z, tu), round(P.smoothWin * fs));
 vx = gradient(xs, 1 / fs); vz = gradient(zs, 1 / fs);
@@ -548,6 +685,7 @@ c = i2; while c < numel(spd) && spd(c + 1) > thr, c = c + 1; end
 E.walkStart = tu(a);
 E.walkEnd   = tu(c);
 E.ia = a; E.ic = c;
+E.steadyStart = tu(i1); E.steadyEnd = tu(i2);
 E.startsAtTraceStart = (a == 1);
 E.excluded  = '';
 end
