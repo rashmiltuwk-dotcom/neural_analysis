@@ -19,6 +19,8 @@ P.fs = 50; P.smoothWin = 0.5; P.dirWin = 1.5; P.speedThr = 0.2;
 P.dirTol = 35;
 P.bridge = 0.3; P.trim = 0.5; P.chunk = 1.0; P.endTol = 45;
 P.plateauFrac = 0.5;
+P.hold = 0.25;     % yaw: runs of identical tracker frames lasting >= this (s) count as frozen and are left out
+P.minLive = 0.5;   % yaw: at least this many seconds of live frames inside the walking period, else NaN
 
 if ~exist(outDir, 'dir'), mkdir(outDir); end
 
@@ -33,6 +35,7 @@ files  = files(ord);
 RC = load_reclass(reclassFile);
 B = [];
 RAW = {};
+RAWH = {};
 SER = struct('t', {}, 'speed', {}, 'x', {}, 'z', {}, 'ia', {}, 'ic', {});
 for b = 1:numel(files)
     S  = load(fullfile(files(b).folder, files(b).name));
@@ -84,6 +87,10 @@ for b = 1:numel(files)
         r.behWalkStart = E.walkStart;
         r.behWalkEnd   = E.walkEnd;
         r.WalkDur      = E.walkEnd - E.walkStart;
+        hd = get_trace(MD(i).Traces, 'StartPosHeadTrace');
+        RAWH{numel(B) + 1} = hd;
+        r.HeadMeanYaw  = mean_yaw(hd, E.walkStart, E.walkEnd, P);   % over this walk's walking period only
+        r.TorsoMeanYaw = mean_yaw(sp, E.walkStart, E.walkEnd, P);
         r.Excluded = E.excluded;
         if r.ManualExcluded, r.Excluded = 'manually excluded'; end
         B = [B; r];
@@ -162,6 +169,8 @@ if reclassifyInteractive
         TB.StartsAtTraceStart(r) = E.startsAtTraceStart;
         TB.behWalkStart(r) = E.walkStart;  TB.behWalkEnd(r) = E.walkEnd;
         TB.WalkDur(r) = E.walkEnd - E.walkStart;
+        TB.HeadMeanYaw(r)  = mean_yaw(RAWH{r}, E.walkStart, E.walkEnd, P);   % new walking period -> recompute yaw
+        TB.TorsoMeanYaw(r) = mean_yaw(RAW{r}, E.walkStart, E.walkEnd, P);
         TB.Excluded{r} = E.excluded;
         if TB.ManualExcluded(r), TB.Excluded{r} = 'manually excluded'; end
         SER(r).ia = E.ia;  SER(r).ic = E.ic;
@@ -271,6 +280,7 @@ for r = keep'
     x = struct('EpochLen', (fin - beg + 1) / fs, 'WalkDur', TB.WalkDur(r), 'Block', TB.Block(r), 'File', M(mm).file, ...
         'TrialNum', TB.TrialNum(r), 'Attempt', TB.Attempt(r), 'TrialStatus', TB.TrialStatus{r}, ...
         'Position', TB.Position{r}, 'Angle', TB.Angle(r), ...
+        'HeadMeanYaw', TB.HeadMeanYaw(r), 'TorsoMeanYaw', TB.TorsoMeanYaw(r), ...
         'OrigPosition', TB.OrigPosition{r}, 'Reclassified', TB.Reclassified(r), ...
         'DistCode', TB.DistCode{r}, 'Epoch', 1, 'nEpochsInWalk', 1, ...
         'behStart_s', TB.behWalkStart(r) - TB.behSetupStart(r), 'behEnd_s', TB.behWalkEnd(r) - TB.behSetupStart(r), ...
@@ -284,7 +294,9 @@ EP.full = struct2table(rowsL);
 EP.note = ['One epoch per walk covering the whole walking period, so EpochLen / nSamples differ between epochs; ', ...
     'behStart_s / behEnd_s are seconds from the start of the StartPos trace; ', ...
     'begsample / endsample index the continuous file in File; ', ...
-    'timeRelSyncStart_s is the epoch start relative to the sync pulse (t_zero), as timeRelSec.'];
+    'timeRelSyncStart_s is the epoch start relative to the sync pulse (t_zero), as timeRelSec; ', ...
+    'HeadMeanYaw / TorsoMeanYaw are circular-mean yaw (deg, 0-360) over the same walking period, live tracker frames only ', ...
+    '(frozen runs >= P.hold s left out; NaN if < P.minLive s of live frames).'];
 save(fullfile(outDir, 'walk_epochs_full_p001.mat'), 'EP');
 writetable(struct2table(rowsL), fullfile(outDir, 'walk_epochs_full_p001.csv'));
 len = [rowsL.EpochLen];
@@ -375,6 +387,34 @@ for p = 1:9
 end
 fprintf('   Total: %d walks = %d epochs, %.1f s of walking (median %.2f s, range %.2f - %.2f s)\n', numel(kept), ...
     sum(TB.nEpochs(kept)), sum(TB.WalkDur(kept)), median(TB.WalkDur(kept)), min(TB.WalkDur(kept)), max(TB.WalkDur(kept)));
+end
+
+function m = mean_yaw(tr, tA, tB, P)
+% Circular-mean yaw (deg, 0-360) between tA and tB (trace clock), from live frames only.
+% Runs of identical frames (x, z and yaw unchanged) lasting >= P.hold s are the tracker freezing and are left out.
+% NaN if the walk was excluded or there are < P.minLive s of live frames in the window.
+m = NaN;
+if isnan(tA) || isnan(tB) || isempty(tr) || ~isfield(tr, 'time') || ~isfield(tr, 'yaw') || numel(tr.time) < 2, return; end
+t = double(tr.time(:)); x = double(tr.x(:)); z = double(tr.z(:)); y = double(tr.yaw(:));
+ok = ~isnan(t) & ~isnan(x) & ~isnan(z) & ~isnan(y);
+t = t(ok); x = x(ok); z = z(ok); y = y(ok);
+[t, iu] = unique(t); x = x(iu); z = z(iu); y = y(iu);
+if numel(t) < 2, return; end
+same = [false; diff(x) == 0 & diff(z) == 0 & diff(y) == 0];
+d  = diff([0; same; 0]);
+st = find(d == 1); en = find(d == -1) - 1;
+tq  = (t(1):1 / P.fs:t(end))';
+gap = false(size(tq));
+for k = 1:numel(st)
+    if t(en(k)) - t(st(k) - 1) < P.hold, continue; end
+    t0 = t(st(k) - 1);
+    if en(k) < numel(t), t1 = t(en(k) + 1); else, t1 = Inf; end
+    gap = gap | (tq > t0 & tq < t1);
+end
+yq = interp1(t, rad2deg(unwrap(deg2rad(y))), tq, 'linear');
+k = tq >= tA & tq <= tB & ~gap;
+if nnz(k) < P.minLive * P.fs, return; end
+m = mod(atan2d(mean(sind(yq(k))), mean(cosd(yq(k)))), 360);
 end
 
 function axW = draw_walk_patterns(fW, TB, SER, P, roomLim)
