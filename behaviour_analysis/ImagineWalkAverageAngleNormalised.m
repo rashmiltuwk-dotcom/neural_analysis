@@ -85,6 +85,15 @@ end
 TY = struct2table(Y);
 for v = {'Status', 'TaskType', 'Position', 'Direction', 'Q', 'DistCode'}, TY.(v{1}) = cellstr(TY.(v{1})); end
 writetable(TY, fullfile(outDir, sprintf('imagine_walk_yaw_combined_%s.csv', pid)));
+
+% Excel workbook: one sheet per trial, one sheet of the combined averages per angle class (position)
+xlsFile = fullfile(outDir, sprintf('imagine_walk_yaw_%s.xlsx', pid));
+byTrial = TY(:, {'Block', 'TrialNum', 'Attempt', 'Status', 'TaskType', 'Position', 'Angle', 'TargetDeg', 'Direction', ...
+    'Q', 'DistCode', 'ImagDur', 'EncodingActual', 'Required', 'ResponseMade', ...
+    'HeadImagYaw', 'HeadIdealYaw', 'HeadCombinedYaw', 'TorsoImagYaw', 'TorsoIdealYaw', 'TorsoCombinedYaw', ...
+    'HeadFrozenFrac', 'TorsoFrozenFrac'});
+writetable(byTrial, xlsFile, 'Sheet', 'by_trial_imagine_walk', 'WriteMode', 'overwritesheet');
+byAngle = table(positions(:), (-75 + 15 * (1:9))', 'VariableNames', {'Position', 'Angle'});
 fprintf('%d attempts with an imagined-walking recording: %d P (physical rotation), %d I (imagined rotation)\n', ...
     height(TY), nnz(strcmp(TY.TaskType, 'P')), nnz(strcmp(TY.TaskType, 'I')));
 
@@ -105,15 +114,11 @@ for s = 1:2
         if any(kp), mC(p) = mod(circ_mean_deg(vc(kp)), 360); end
     end
 
-    % table of the combined averages (P as measured + I with the required rotation added): command window + CSV
+    % combined averages (P as measured + I with the required rotation added), for the by_angleclass sheet
     AV = table(positions(:), (-75 + 15 * (1:9))', nP(:) + nI(:), mC(:), 'VariableNames', ...
         {'Position', 'Angle', 'n', 'Combined'});
-    fprintf('\n%s yaw during imagined walking, combined (P + I with required rotation; deg, circular mean)\n', segs{s, 1});
-    fprintf('%-4s %5s %3s | %9s\n', 'Pos', 'angle', 'n', 'combined');
-    for p = 1:9
-        fprintf('%-4s %+5d %3d | %9.1f\n', positions{p}, -75 + 15 * p, nP(p) + nI(p), mC(p));
-    end
-    writetable(AV, fullfile(outDir, sprintf('imagine_walk_yaw_averages_%s_%s.csv', lower(segs{s, 1}), pid)));
+    byAngle.n = AV.n;
+    byAngle.([segs{s, 1} 'Combined']) = mC(:);
 
     fig = figure('Color', 'w', 'Position', [100 100 900 600]);
     ax  = axes(fig, 'Position', [0.09 0.10 0.88 0.68]); hold(ax, 'on');   % room above for the legend
@@ -133,6 +138,8 @@ for s = 1:2
     exportgraphics(fig, fullfile(outDir, sprintf('imagine_walk_yaw_combined_%s_%s.png', lower(segs{s, 1}), pid)), ...
         'Resolution', 200);
 end
+writetable(byAngle, xlsFile, 'Sheet', 'by_angleclass', 'WriteMode', 'overwritesheet');
+fprintf('\nSaved %s (sheets: by_trial_imagine_walk, by_angleclass)\n', xlsFile);
 
 function d = yaw_change(T, phases, nextPhase)
 % net torso yaw change over the listed phases, up to the first frame of nextPhase (from the accuracy script)
