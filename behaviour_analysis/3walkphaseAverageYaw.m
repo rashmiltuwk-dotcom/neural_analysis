@@ -1,22 +1,24 @@
 clearvars; clc; close all;
 
+
 pid     = 'p001';
 dataDir = 'C:\Users\rashm\Documents\opm_pi\participant_001\Behavioural_Data_001_01\Matlab';
 outDir  = 'C:\Users\rashm\Documents\opm_pi\participant_001\Behavioural_Data_001_01\results\p001';
 rcFile  = fullfile(outDir, sprintf('reclassified_attempts_%s.csv', pid));
-navOnlyRC = [6 46 1];      % Block TrialNum Attempt: reclassification applies to navigation only
+navOnlyRC = [6 46 1];       % Block TrialNum Attempt: reclassification applies to navigation only
 
 % walking period (navigation): same rules as the epoching script
 P.fs = 50; P.smoothWin = 0.5; P.dirWin = 1.5; P.speedThr = 0.2;
 P.dirTol = 35; P.bridge = 0.3; P.trim = 0.5; P.chunk = 1.0; P.endTol = 45; P.plateauFrac = 0.5;
-% yaw average
-P.hold = 0.25;      % s, frozen run length that is left out
-P.minLive = 0.5;    % s of live 50 Hz samples needed
-% stale frames at the start of the PhysicallyWalk / ImagineWalking traces
+% stale frames at the start of a trace
 P.jumpThr = 0.05; P.yawJump = 20; P.jumpWin = 3;
+% 50 Hz samples only between live frames no more than this far apart
+P.maxDt = 0.1;
 
-phases = {'navigation', 'StartPos'; 'physicallywalk', 'PhysicallyWalk'; 'imagine_walk', 'ImagineWalking'};
-segs   = {'head', 'Head'; 'torso', 'Torso'};
+phases = {'navigation', 'StartPos', 'Time from start of walking period (s)'; ...
+          'physicallywalk', 'PhysicallyWalk', 'Time from start of trace (s)'; ...
+          'imagine_walk', 'ImagineWalking', 'Time from start of trace (s)'};
+segs = {'Torso', [0.12 0.31 0.61]; 'Head', [0.70 0.09 0.17]};
 positions = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
 if ~exist(outDir, 'dir'), mkdir(outDir); end
 
@@ -27,148 +29,179 @@ files  = dir(fullfile(dataDir, 'P*_MasterData.mat'));
 blocks = arrayfun(@(d) str2double(regexp(d.name, '^P\d+_(\d+)_', 'tokens', 'once')), files);
 [blocks, ord] = sort(blocks);
 files  = files(ord);
-
-R = cell(3, 2);            % rows per phase x segment
+MDs = cell(numel(files), 1);
 for b = 1:numel(files)
     S0 = load(fullfile(files(b).folder, files(b).name));
-    MD = S0.MasterData;
-    for i = 1:numel(MD)
-        base = struct('Block', blocks(b), 'TrialNum', double(MD(i).TrialNum), 'Attempt', double(MD(i).Attempt), ...
-            'Status', char(MD(i).Status), 'TaskType', char(MD(i).TaskType), 'Position', char(MD(i).Position), ...
-            'Angle', double(MD(i).StartAngleDeg), 'OrigPosition', char(MD(i).Position), ...
-            'OrigAngle', double(MD(i).StartAngleDeg), 'Reclassified', false, 'DistCode', char(MD(i).DistCode));
-        k = [];
-        if ~isempty(RC), k = find(RC.Block == base.Block & RC.TrialNum == base.TrialNum & RC.Attempt == base.Attempt, 1, 'last'); end
-        isNavOnly = ismember([base.Block base.TrialNum base.Attempt], navOnlyRC, 'rows');
+    MDs{b} = S0.MasterData;
+end
 
-        for ph = 1:3
-            r = base;
-            if ~isempty(k)
-                if ismember('Action', RC.Properties.VariableNames) && strcmp(RC.Action{k}, 'exclude')
-                    if ph == 1, continue; end                     % exclusion: navigation only
-                elseif ~(ph > 1 && isNavOnly)
-                    r.Position = RC.NewPosition{k}; r.Angle = RC.NewAngle(k); r.Reclassified = true;
+xlsFile = fullfile(outDir, sprintf('yaw_variability_three_phases_%s.xlsx', pid));
+for ph = 1:size(phases, 1)
+    % ---- each trial's window and its 50 Hz yaw samples ----
+    W = [];
+    for b = 1:numel(files)
+        MD = MDs{b};
+        for i = 1:numel(MD)
+            w = struct('Block', blocks(b), 'TrialNum', double(MD(i).TrialNum), 'Attempt', double(MD(i).Attempt), ...
+                'Position', char(MD(i).Position), 'Angle', double(MD(i).StartAngleDeg));
+            if ~isempty(RC)
+                k = find(RC.Block == w.Block & RC.TrialNum == w.TrialNum & RC.Attempt == w.Attempt, 1, 'last');
+                if ~isempty(k)
+                    if ismember('Action', RC.Properties.VariableNames) && strcmp(RC.Action{k}, 'exclude'), continue; end
+                    if ~(ph > 1 && ismember([w.Block w.TrialNum w.Attempt], navOnlyRC, 'rows'))
+                        w.Position = RC.NewPosition{k}; w.Angle = RC.NewAngle(k);
+                    end
                 end
             end
-            trT = get_trace(MD(i).Traces, [phases{ph, 2} 'TorsoTrace']);
-            trH = get_trace(MD(i).Traces, [phases{ph, 2} 'HeadTrace']);
-            note = '';
+            trT = trim_stale(get_trace(MD(i).Traces, [phases{ph, 2} 'TorsoTrace']), P);
+            trH = trim_stale(get_trace(MD(i).Traces, [phases{ph, 2} 'HeadTrace']), P);
             if ph == 1
-                [tA, tB] = walk_period(trT, r.Angle, P);
-                if isnan(tA), note = 'no walking period'; end
-                t0 = first_time(trT);
+                S = series(trT, P);
+                if isempty(S), continue; end
+                [ia, ic] = walk_period(S, w.Angle, P);
+                if isnan(ia), continue; end
+                w.t0 = S.t(ia); w.t1 = S.t(ic);
             else
-                trT = trim_stale(trT, P); trH = trim_stale(trH, P);
-                if isnan(first_time(trT)) && isnan(first_time(trH)), continue; end
-                tA = min([first_time(trH), first_time(trT)]);     % whole trace
-                tB = max([last_time(trH), last_time(trT)]);
-                t0 = tA;
+                w.t0 = min([first_time(trT), first_time(trH)]);
+                w.t1 = max([last_time(trT), last_time(trH)]);
+                if isnan(w.t0), continue; end
             end
-            tr2 = {trH, trT};
-            for s = 1:2
-                [m, sd, live, frz] = mean_yaw(tr2{s}, tA, tB, P);
-                q = r;
-                q.WindowStart_s = tA - t0; q.WindowEnd_s = tB - t0; q.WindowDur_s = tB - tA;
-                q.LiveDur_s = live; q.FrozenFrac = frz;
-                q.MeanYaw_deg = m;                                      % 0-360
-                q.MeanYawSigned_deg = mod(m + 180, 360) - 180;          % -180 to 180
-                q.WithinTrialSD_deg = sd;                               % circular SD of the 50 Hz samples
-                if isempty(note) && isnan(m), q.Note = 'too little live tracker data'; else, q.Note = note; end
-                R{ph, s} = [R{ph, s}; q];
-            end
+            w.G = {at50(raw_frames(trT), w.t0, w.t1, P), at50(raw_frames(trH), w.t0, w.t1, P)};   % torso, head
+            W = [W; w]; %#ok<AGROW>
         end
     end
-end
+    fprintf('%s: %d trials\n', phases{ph, 1}, numel(W));
 
-% ---- Excel: six by_trial sheets + by_angleclass ----
-xlsFile = fullfile(outDir, sprintf('yaw_average_three_phases_%s.xlsx', pid));
-BA = [];
-for ph = 1:3
+    % ---- position means: circular mean of each trial's mean yaw ----
+    posMean = nan(2, 9);
     for s = 1:2
-        T = struct2table(R{ph, s});
-        T = sortrows(T, {'Position', 'Block', 'TrialNum', 'Attempt'});
-        writetable(T, xlsFile, 'Sheet', sprintf('by_trial_%s_%s', phases{ph, 1}, segs{s, 1}), 'WriteMode', 'overwritesheet');
         for p = 1:9
-            kp = strcmp(T.Position, positions{p});
-            v  = T.MeanYaw_deg(kp); v = v(~isnan(v));
-            [mm, sdA] = circ_stats(v);
-            BA = [BA; struct('Phase', phases{ph, 1}, 'Segment', segs{s, 1}, 'Position', positions{p}, ...
-                'Angle', -75 + 15 * p, 'nTrials', nnz(kp), 'nWithYaw', numel(v), 'MeanYaw_deg', mm, ...
-                'MeanYawSigned_deg', mod(mm + 180, 360) - 180, 'AcrossTrialSD_deg', sdA)]; %#ok<AGROW>
+            tm = [];
+            for r = find(strcmp({W.Position}, positions{p}))
+                G = W(r).G{s};
+                if nnz(G.val) > 1, tm(end + 1) = circ_mean_deg(G.yq(G.val)); end %#ok<AGROW>
+            end
+            if ~isempty(tm), posMean(s, p) = mod(circ_mean_deg(tm), 360); end
         end
     end
+
+    % ---- by_trial ----
+    nW = numel(W);
+    BT = table([W.Block]', [W.TrialNum]', [W.Attempt]', {W.Position}', [W.Angle]', [W.t1]' - [W.t0]', ...
+        'VariableNames', {'Block', 'TrialNum', 'Attempt', 'Position', 'Angle', 'StableDur_s'});
+    for s = 1:2
+        pm = nan(nW, 1); tmn = nan(nW, 1); yv = nan(nW, 1); lt = zeros(nW, 1); fz = nan(nW, 1);
+        for r = 1:nW
+            p = find(strcmp(positions, W(r).Position));
+            pm(r) = posMean(s, p);
+            G = W(r).G{s};
+            fz(r) = G.frz; lt(r) = nnz(G.val) / P.fs;
+            if nnz(G.val) < 2, continue; end
+            y = G.yq(G.val);
+            tmn(r) = mod(circ_mean_deg(y), 360);
+            yv(r)  = mean(abs(mod(y - pm(r) + 180, 360) - 180));   % mean |deviation from the position mean|, deg
+        end
+        BT.([segs{s, 1} 'PositionMean']) = pm;
+        BT.([segs{s, 1} 'TrialMean'])    = tmn;
+        BT.([segs{s, 1} 'YawVar_deg'])   = yv;
+        BT.([segs{s, 1} 'LiveTime_s'])   = lt;
+        BT.([segs{s, 1} 'FrozenFrac'])   = fz;
+    end
+    BT = sortrows(BT, {'Position', 'Block', 'TrialNum'});
+
+    % ---- by_angleclass: every trial weighs the same ----
+    BA = table(positions(:), (-75 + 15 * (1:9))', 'VariableNames', {'Position', 'Angle'});
+    BA.n = arrayfun(@(p) nnz(strcmp(BT.Position, positions{p})), (1:9)');
+    for s = 1:2
+        v = BT.([segs{s, 1} 'YawVar_deg']);
+        BA.([segs{s, 1} 'PositionMean']) = posMean(s, :)';
+        BA.(['n' segs{s, 1}]) = zeros(9, 1);
+        for f = {'YawVar_mean', 'YawVar_SD', 'YawVar_median'}, BA.([segs{s, 1} f{1}]) = nan(9, 1); end
+        for p = 1:9
+            x = v(strcmp(BT.Position, positions{p}) & ~isnan(v));
+            BA.(['n' segs{s, 1}])(p, 1) = numel(x);
+            if isempty(x), continue; end
+            BA.([segs{s, 1} 'YawVar_mean'])(p, 1)   = mean(x);
+            BA.([segs{s, 1} 'YawVar_SD'])(p, 1)     = std(x);
+            BA.([segs{s, 1} 'YawVar_median'])(p, 1) = median(x);
+        end
+    end
+    writetable(BT, xlsFile, 'Sheet', ['by_trial_' phases{ph, 1}], 'WriteMode', 'overwritesheet');
+    writetable(BA, xlsFile, 'Sheet', ['by_angleclass_' phases{ph, 1}], 'WriteMode', 'overwritesheet');
+
+    % ---- figures: raw yaw at 50 Hz, one panel per position, dashed line = position mean ----
+    xmax = ceil(max([W.t1] - [W.t0]));
+    for s = 1:2
+        col = segs{s, 2};
+        fig = figure('Color', 'w', 'Position', [40 40 1500 1150]);
+        tl  = tiledlayout(fig, 3, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
+        for p = 1:9
+            ax = nexttile(tl, p); hold(ax, 'on');
+            idx = find(strcmp({W.Position}, positions{p}));
+            dur = [];
+            for r = idx
+                G = W(r).G{s};
+                dur(end + 1) = W(r).t1 - W(r).t0; %#ok<AGROW>
+                if nnz(G.val) < 2, continue; end
+                y = G.yq; y(~G.val) = NaN;
+                y = y - 360 * floor(mean(y, 'omitnan') / 360);           % raw yaw, kept in 0-360
+                plot(ax, G.tq - W(r).t0, y, '-', 'Color', [col 0.6], 'LineWidth', 0.9);
+            end
+            if ~isnan(posMean(s, p)), yline(ax, posMean(s, p), '--k', 'LineWidth', 1.6); end
+            ttl = sprintf('%s (%+d%s)  n = %d', positions{p}, -75 + 15 * p, char(176), numel(idx));
+            if ~isempty(dur), ttl = sprintf('%s, %.1f s', ttl, mean(dur)); end
+            title(ax, ttl, 'Color', col, 'FontSize', 12, 'FontWeight', 'normal', 'HorizontalAlignment', 'left', ...
+                'Units', 'normalized', 'Position', [0 1.01 0]);
+            xlim(ax, [0 xmax]);
+            set(ax, 'Box', 'off', 'TickDir', 'out', 'FontSize', 10, 'XGrid', 'on', 'YGrid', 'on', 'GridColor', [0.88 0.88 0.88]);
+            if mod(p, 3) == 1, ylabel(ax, sprintf('%s yaw (%s)', segs{s, 1}, char(176))); end
+            if p > 6, xlabel(ax, phases{ph, 3}); else, xticklabels(ax, {}); end
+        end
+        exportgraphics(fig, fullfile(outDir, sprintf('%s_yaw_%s_3x3_raw_%s.png', phases{ph, 1}, lower(segs{s, 1}), pid)), ...
+            'Resolution', 200);
+    end
 end
-writetable(struct2table(BA), xlsFile, 'Sheet', 'by_angleclass', 'WriteMode', 'overwritesheet');
-fprintf('Saved %s\n  sheets: by_trial_{navigation,physicallywalk,imagine_walk}_{head,torso}, by_angleclass\n', xlsFile);
+fprintf('Saved %s\n  sheets: by_trial_<phase>, by_angleclass_<phase> for navigation, physicallywalk, imagine_walk\n', xlsFile);
 
 % ---------------------------------------------------------------------------------------------------
 
-function [m, sd] = circ_stats(a)
-% circular mean (0-360) and circular SD (deg) of angles in deg
-m = NaN; sd = NaN;
+function m = circ_mean_deg(a)
 a = a(~isnan(a));
-if isempty(a), return; end
-S = mean(sind(a)); C = mean(cosd(a));
-m = mod(atan2d(S, C), 360);
-sd = rad2deg(sqrt(-2 * log(max(hypot(S, C), 1e-12))));
+m = atan2d(mean(sind(a)), mean(cosd(a)));
 end
 
-function [m, sd, live, frz] = mean_yaw(tr, tA, tB, P)
-% Circular-mean yaw (deg, 0-360) between tA and tB (trace clock) on a P.fs grid, live frames only:
-% runs of identical frames (x, z and yaw unchanged) lasting >= P.hold s are left out (same as the epoching script).
-% live = s of live samples used; frz = fraction of the window that was frozen.
-m = NaN; sd = NaN; live = 0; frz = NaN;
-if isnan(tA) || isnan(tB) || isempty(tr) || ~isfield(tr, 'time') || ~isfield(tr, 'yaw') || numel(tr.time) < 2, return; end
-t = double(tr.time(:)); x = double(tr.x(:)); z = double(tr.z(:)); y = double(tr.yaw(:));
-ok = ~isnan(t) & ~isnan(x) & ~isnan(z) & ~isnan(y);
-t = t(ok); x = x(ok); z = z(ok); y = y(ok);
-[t, iu] = unique(t); x = x(iu); z = z(iu); y = y(iu);
-if numel(t) < 2, return; end
-same = [false; diff(x) == 0 & diff(z) == 0 & diff(y) == 0];
-d  = diff([0; same; 0]);
-st = find(d == 1); en = find(d == -1) - 1;
-tq  = (t(1):1 / P.fs:t(end))';
-gap = false(size(tq));
-for k = 1:numel(st)
-    if t(en(k)) - t(st(k) - 1) < P.hold, continue; end
-    t0 = t(st(k) - 1);
-    if en(k) < numel(t), t1 = t(en(k) + 1); else, t1 = Inf; end
-    gap = gap | (tq > t0 & tq < t1);
-end
-yq  = interp1(t, rad2deg(unwrap(deg2rad(y))), tq, 'linear');
-win = tq >= tA & tq <= tB;
-k   = win & ~gap;
-live = nnz(k) / P.fs;
-frz  = nnz(win & gap) / max(nnz(win), 1);
-if nnz(k) < P.minLive * P.fs, return; end
-[m, sd] = circ_stats(yq(k));
+function G = at50(F, t0, t1, P)
+% 50 Hz yaw samples between t0 and t1. val = the sample lies between two consecutive frames that are both live and
+% <= P.maxDt apart. frz = fraction of the frames in the window that repeat the previous frame.
+G = struct('tq', [], 'yq', [], 'val', false(0, 1), 'frz', NaN);
+if isempty(F.t), return; end
+t = F.t;
+tq = (t0:1 / P.fs:t1)';
+tq = tq(tq >= t(1) & tq <= t(end));
+if isempty(tq), return; end
+k = discretize(tq, t);                        % interval index: t(k) <= tq < t(k+1)
+k(isnan(k)) = numel(t) - 1;                   % tq == t(end)
+live = ~F.rep;
+G.tq  = tq;
+G.yq  = interp1(t, F.y, tq, 'linear');
+G.val = live(k) & live(k + 1) & (t(k + 1) - t(k)) <= P.maxDt;
+inw = t >= t0 & t <= t1;
+if any(inw), G.frz = mean(F.rep(inw)); end
 end
 
-function [tA, tB] = walk_period(tr, label, P)
-% epoching-script walking period on the torso trace (trace clock); NaN if the walk fails the criteria
-tA = NaN; tB = NaN;
-if isempty(tr) || ~isfield(tr, 'time') || numel(tr.time) < 3, return; end
-t = double(tr.time(:)); x = double(tr.x(:)); z = double(tr.z(:));
-ok = ~isnan(t) & ~isnan(x) & ~isnan(z);
-[t, iu] = unique(t(ok)); x = x(ok); z = z(ok); x = x(iu); z = z(iu);
-if numel(t) < 3, return; end
-fs = P.fs;
-tu = (t(1):1 / fs:t(end))';
-xs = movmean(interp1(t, x, tu), round(P.smoothWin * fs));
-zs = movmean(interp1(t, z, tu), round(P.smoothWin * fs));
-vx = gradient(xs, 1 / fs); vz = gradient(zs, 1 / fs);
-spd = hypot(vx, vz);
-wd = round(P.dirWin * fs);
-dirErr = mod(atan2d(movmean(vx, wd), -movmean(vz, wd)) - label + 180, 360) - 180;
-steady = spd > P.speedThr & abs(dirErr) <= P.dirTol;
-steady = bridge_gaps(steady, round(P.bridge * fs));
-[len, i1, i2] = longest_run(steady);
-if len == 0 || (i2 - i1) / fs - 2 * P.trim < P.chunk, return; end
-if abs(mod(atan2d(x(end), -z(end)) - label + 180, 360) - 180) > P.endTol, return; end
-thr = P.plateauFrac * median(spd(i1:i2));
-a = i1; while a > 1 && spd(a - 1) > thr, a = a - 1; end
-c = i2; while c < numel(spd) && spd(c + 1) > thr, c = c + 1; end
-tA = tu(a); tB = tu(c);
+function tr = get_trace(traces, name)
+tr = [];
+if isfield(traces, name), tr = traces.(name); end
+end
+
+function t = first_time(tr)
+t = NaN;
+if ~isempty(tr) && isfield(tr, 'time') && ~isempty(tr.time), t = min(double(tr.time(:))); end
+end
+
+function t = last_time(tr)
+t = NaN;
+if ~isempty(tr) && isfield(tr, 'time') && ~isempty(tr.time), t = max(double(tr.time(:))); end
 end
 
 function tr = trim_stale(tr, P)
@@ -185,19 +218,50 @@ for q = 1:numel(f)
 end
 end
 
-function tr = get_trace(traces, name)
-tr = [];
-if isfield(traces, name), tr = traces.(name); end
+function F = raw_frames(tr)
+% raw tracker frames in time order: time, unwrapped yaw (deg), and whether the frame repeats the previous one
+F = struct('t', [], 'y', [], 'rep', []);
+if isempty(tr) || ~isfield(tr, 'time') || ~isfield(tr, 'yaw') || numel(tr.time) < 2, return; end
+t = double(tr.time(:)); y = double(tr.yaw(:)); x = double(tr.x(:)); z = double(tr.z(:));
+ok = ~isnan(t) & ~isnan(y);
+t = t(ok); y = y(ok); x = x(ok); z = z(ok);
+[t, iu] = unique(t); y = y(iu); x = x(iu); z = z(iu);
+if numel(t) < 2, return; end
+F.t = t;
+F.y = rad2deg(unwrap(deg2rad(y)));
+F.rep = [false; diff(x) == 0 & diff(z) == 0 & diff(y) == 0];
 end
 
-function t = first_time(tr)
-t = NaN;
-if ~isempty(tr) && isfield(tr, 'time') && ~isempty(tr.time), t = min(double(tr.time(:))); end
+function S = series(tr, P)
+% P.fs grid: smoothed position -> speed
+S = [];
+if isempty(tr) || ~isfield(tr, 'time') || numel(tr.time) < 3, return; end
+t = double(tr.time(:)); x = double(tr.x(:)); z = double(tr.z(:)); y = double(tr.yaw(:));
+ok = ~isnan(t) & ~isnan(x) & ~isnan(z) & ~isnan(y);
+t = t(ok); x = x(ok); z = z(ok);
+[t, iu] = unique(t); x = x(iu); z = z(iu);
+if numel(t) < 3, return; end
+tu = (t(1):1 / P.fs:t(end))';
+w  = round(P.smoothWin * P.fs);
+xs = movmean(interp1(t, x, tu), w); zs = movmean(interp1(t, z, tu), w);
+S.t = tu; S.vx = gradient(xs, 1 / P.fs); S.vz = gradient(zs, 1 / P.fs);
+S.spd = hypot(S.vx, S.vz);
+S.xEnd = x(end); S.zEnd = z(end);
 end
 
-function t = last_time(tr)
-t = NaN;
-if ~isempty(tr) && isfield(tr, 'time') && ~isempty(tr.time), t = max(double(tr.time(:))); end
+function [ia, ic] = walk_period(S, label, P)
+% epoching-script walking period on the torso trace (indices into S.t)
+ia = NaN; ic = NaN; fs = P.fs;
+d = atan2d(movmean(S.vx, round(P.dirWin * fs)), -movmean(S.vz, round(P.dirWin * fs)));
+steady = S.spd > P.speedThr & abs(mod(d - label + 180, 360) - 180) <= P.dirTol;
+steady = bridge_gaps(steady, round(P.bridge * fs));
+[len, i1, i2] = longest_run(steady);
+if len == 0 || (i2 - i1) / fs - 2 * P.trim < P.chunk, return; end
+if abs(mod(atan2d(S.xEnd, -S.zEnd) - label + 180, 360) - 180) > P.endTol, return; end
+thr = P.plateauFrac * median(S.spd(i1:i2));
+a = i1; while a > 1 && S.spd(a - 1) > thr, a = a - 1; end
+c = i2; while c < numel(S.spd) && S.spd(c + 1) > thr, c = c + 1; end
+ia = a; ic = c;
 end
 
 function s = bridge_gaps(s, maxGap)
