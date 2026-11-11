@@ -110,7 +110,9 @@ end
 
 % ---- figure ----
 cmap = jet(256);
-fig = figure('Color', 'w', 'Position', [30 80 2000 760]);
+scr = get(0, 'ScreenSize');                                   % fit the screen, so MATLAB does not squeeze it
+figW = round(0.95 * scr(3)); figH = min(round(0.40 * figW), round(0.85 * scr(4)));
+fig = figure('Color', 'w', 'Units', 'pixels', 'Position', [20 60 figW figH]);
 tl  = tiledlayout(fig, 1, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
 for ph = 1:3
     ax = nexttile(tl); hold(ax, 'on');
@@ -138,7 +140,7 @@ for ph = 1:3
     if ph == 1, ylabel(ax, 'Room Z position (m)'); end
     colormap(ax, cmap); caxis(ax, speedLim);
 end
-cb = colorbar(ax); cb.Layout.Tile = 'south';
+cb = colorbar(ax); cb.Layout.Tile = 'east';                 % at the side, clear of the x-axis labels
 % no text under the figure: the colour bar is speed in m/s (what each speed is: see the header)
 exportgraphics(fig, fullfile(outDir, sprintf('average_head_direction_arrows_%s.png', pid)), 'Resolution', 200);
 
