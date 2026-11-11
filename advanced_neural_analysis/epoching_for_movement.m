@@ -13,7 +13,9 @@ epochMode = '';   % '' = ask at the start of each run; or 'first3' / 'full' / 's
 includeRejected   = true;
 roomLim   = [-2 2];
 reclassifyInteractive = true;
-reclassFile = fullfile(outDir, 'reclassified_attempts_p001.csv');   % saved reclassifications / exclusions
+reclassFile = fullfile(outDir, 'reclassified_attempts_p001.csv');   % saved reclassifications / exclusions (navigation)
+reclassFilePW = fullfile(outDir, 'reclassified_attempts_pw_p001.csv');   % PhysicallyWalk-only reclassifications / exclusions
+navOnlyRC = [6 46 1];   % Block TrialNum Attempt: navigation reclassifications that do NOT carry over to PhysicallyWalk
 manualExclude = [];
 
 P.fs = 50; P.smoothWin = 0.5; P.dirWin = 1.5; P.speedThr = 0.2;
@@ -25,6 +27,14 @@ P.minLive = 0.5;   % yaw: at least this many seconds of live frames inside the w
 P.epochLen  = 3;     % 'first3': epoch length (s) from the start of the walking period
 P.yawBand   = 15;    % 'stableyaw': longest stretch of the walking period where torso yaw stays within this many deg
 P.yawSmooth = 0.5;   % 'stableyaw': s, moving mean on torso yaw before finding that stretch
+% PhysicallyWalk = the walk from the start position back to the centre. Same walking-period rules as navigation,
+% with these differences: body position from the head tracker (the torso tracker is often stale here), walking
+% direction = start angle + 180, a lower speed threshold (slower walk), and the START (not the end) must be at the
+% start position. For 'stableyaw', PhysicallyWalk uses head yaw.
+P.pwSpeedThr = 0.1;              % m/s
+P.headOff = 0.41; P.headAng = 10; % body = head - headOff m along (yaw - headAng)
+P.startTol = 45;                 % deg: walk must start within this of the start position's angle
+P.jumpThr = 0.05; P.yawJump = 20; P.jumpWin = 3;   % stale frames at the start of the PhysicallyWalk traces
 
 if ~exist(outDir, 'dir'), mkdir(outDir); end
 
@@ -51,11 +61,17 @@ blocks = cellfun(@(t) str2double(t{2}), tok);
 [blocks, ord] = sort(blocks);
 files  = files(ord);
 
-RC = load_reclass(reclassFile);
+RC  = load_reclass(reclassFile);
+RCP = load_reclass(reclassFilePW);
 B = [];
 RAW = {};
 RAWH = {};
 SER = struct('t', {}, 'speed', {}, 'x', {}, 'z', {}, 'ia', {}, 'ic', {});
+BP = [];          % PhysicallyWalk rows
+RAWP = {};        % PhysicallyWalk body trace (from the head), used for the walking period
+RAWPH = {};       % PhysicallyWalk head trace
+RAWPT = {};       % PhysicallyWalk torso trace
+SERP = struct('t', {}, 'speed', {}, 'x', {}, 'z', {}, 'ia', {}, 'ic', {});
 for b = 1:numel(files)
     S  = load(fullfile(files(b).folder, files(b).name));
     MD = S.MasterData;
@@ -84,6 +100,8 @@ for b = 1:numel(files)
                 r.Position = RC.NewPosition{k}; r.Angle = RC.NewAngle(k); r.Reclassified = true;
             end
         end
+        r.BasePosition = r.OrigPosition;   % label a 'restore' goes back to (navigation: the original label)
+        r.BaseAngle    = r.OrigAngle;
 
         sp = get_trace(MD(i).Traces, 'StartPosTorsoTrace');
         ce = [last_time(get_trace(MD(i).Traces, 'CloseEyesTorsoTrace')), ...
@@ -118,130 +136,87 @@ for b = 1:numel(files)
         r.Excluded = E.excluded;
         if r.ManualExcluded, r.Excluded = 'manually excluded'; end
         B = [B; r];
+
+        % ---- PhysicallyWalk: same classification as navigation ----
+        rp = struct();
+        rp.Block = r.Block; rp.Order = r.Order; rp.TrialNum = r.TrialNum; rp.Attempt = r.Attempt;
+        rp.Status = r.Status; rp.TrialStatus = r.TrialStatus;
+        rp.Position = r.OrigPosition; rp.Angle = r.OrigAngle;
+        if r.Reclassified && ~ismember([r.Block r.TrialNum r.Attempt], navOnlyRC, 'rows')
+            rp.Position = r.Position; rp.Angle = r.Angle;          % navigation reclassification carries over
+        end
+        rp.DistCode = r.DistCode; rp.TargetDist = r.TargetDist;
+        rp.OrigPosition = r.OrigPosition; rp.OrigAngle = r.OrigAngle;
+        rp.BasePosition = rp.Position; rp.BaseAngle = rp.Angle;    % label before any PhysicallyWalk-only change
+        rp.ManualExcluded = ismember(rp.TrialNum, manualExclude);   % (navigation exclusions do not carry over)
+        k = find(RCP.Block == rp.Block & RCP.TrialNum == rp.TrialNum & RCP.Attempt == rp.Attempt, 1, 'last');
+        if ~isempty(k)
+            if strcmp(RCP.Action{k}, 'exclude'), rp.ManualExcluded = true;
+            else, rp.Position = RCP.NewPosition{k}; rp.Angle = RCP.NewAngle(k); end
+        end
+        rp.Reclassified = ~strcmp(rp.Position, rp.OrigPosition);
+        hdP = trim_stale(get_trace(MD(i).Traces, 'PhysicallyWalkHeadTrace'), P);
+        toP = trim_stale(get_trace(MD(i).Traces, 'PhysicallyWalkTorsoTrace'), P);
+        bdP = body_from_head(hdP, P);
+        rp.behSetupStart = first_time(bdP);     % behStart_s / behEnd_s of PhysicallyWalk epochs count from here
+        E = pw_period(bdP, rp.Angle, P, epochMode);
+        n = numel(BP) + 1;
+        RAWP{n} = bdP; RAWPH{n} = hdP; RAWPT{n} = toP;
+        SERP(n) = struct('t', E.tRel, 'speed', E.speed, 'x', E.x, 'z', E.z, 'ia', E.ia, 'ic', E.ic);
+        rp.StartsAtTraceStart = E.startsAtTraceStart;
+        rp.behWalkStart  = E.walkStart;  rp.behWalkEnd  = E.walkEnd;  rp.WalkDur     = E.walkEnd - E.walkStart;
+        rp.FullWalkStart = E.fullStart;  rp.FullWalkEnd = E.fullEnd;  rp.FullWalkDur = E.fullEnd - E.fullStart;
+        rp.SteadyDur     = E.steadyEnd - E.steadyStart;
+        rp.HeadMeanYaw   = mean_yaw(hdP, E.walkStart, E.walkEnd, P);
+        rp.TorsoMeanYaw  = mean_yaw(toP, E.walkStart, E.walkEnd, P);
+        rp.Excluded = E.excluded;
+        if rp.ManualExcluded, rp.Excluded = 'manually excluded'; end
+        BP = [BP; rp];
     end
 end
 TB = struct2table(B);
 TB = derive_columns(TB, includeRejected);
+TP = struct2table(BP);
+TP = derive_columns(TP, includeRejected);
 isRej = strcmp(TB.TrialStatus, 'REJECTED');
 
 pos9     = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
 angleOf  = arrayfun(@(k) TB.OrigAngle(find(strcmp(TB.OrigPosition, pos9{k}), 1)), 1:9);
 
-fW  = figure('Color', 'w', 'Position', [40 40 1300 1300]);
-axW = draw_walk_patterns(fW, TB, SER, P, roomLim);
+% ---- navigation: walk patterns, reclassify / exclude, summary, final figure ----
+navFcn = @(r, a) nav_period(RAW{r}, a, P, epochMode);
+navYaw = @(r, E) deal(mean_yaw(RAWH{r}, E.walkStart, E.walkEnd, P), mean_yaw(RAW{r}, E.walkStart, E.walkEnd, P));
+fW  = figure('Color', 'w', 'Position', [40 40 1300 1300], 'Name', 'Navigation walks');
+axW = draw_walk_patterns(fW, TB, SER, P, roomLim, 'Navigation (StartPos trace)');
 drawnow;
-
 if reclassifyInteractive
-    answer = questdlg({'Do you want to move any walk to a different angle,', ...
-        'or leave a walk out of the analysis?', '', ...
-        'Yes: click walks in the figure.  No: continue as shown.'}, ...
-        'Reclassify or exclude walks', 'Yes', 'No', 'No');
-    while strcmp(answer, 'Yes')
-        figure(fW);
-        fprintf(['\nClick the walk you want to change in the figure.\n', ...
-            'When you are done, press Enter with the figure window selected.\n']);
-        [xc, yc] = ginput(1);
-        if isempty(xc), break; end
-        p = find(axW == gca, 1);
-        if isempty(p), continue; end
-        cand = find(strcmp(TB.Position, pos9{p}));
-        dmin = inf(size(cand));
-        for q = 1:numel(cand)
-            S = SER(cand(q));
-            if ~isempty(S.x), dmin(q) = min(hypot(S.x - xc, S.z - yc)); end
-        end
-        [dBest, q] = min(dmin);
-        if isempty(cand) || dBest > 0.25
-            fprintf('  No walk within 0.25 m of that click in %s.\n', pos9{p});
-            continue
-        end
-        r = cand(q);
-        hSel = plot(axW(p), SER(r).x, SER(r).z, 'k-', 'LineWidth', 4); drawnow;
-
-        if TB.ManualExcluded(r), stateTxt = 'excluded by hand';
-        elseif isempty(TB.Excluded{r}), stateTxt = 'kept';
-        else, stateTxt = ['excluded: ' TB.Excluded{r}]; end
-        opts = [arrayfun(@(k) sprintf('%s (%g deg)', pos9{k}, angleOf(k)), 1:9, 'UniformOutput', false), ...
-            {'EXCLUDE ENTIRELY', sprintf('restore original (%s, no manual changes)', TB.OrigPosition{r}), 'cancel'}];
-        sel = listdlg('PromptString', {trial_label(TB, r), sprintf('labelled %s, shown under %s, %s.', TB.OrigPosition{r}, TB.Position{r}, ...
-            stateTxt), 'New angle, or exclude:'}, 'SelectionMode', 'single', 'ListString', opts, ...
-            'ListSize', [320 250]);
-        delete(hSel);
-        if isempty(sel) || sel == numel(opts), continue; end
-        if sel == 10
-            TB.ManualExcluded(r) = true;
-            TB.Excluded{r} = 'manually excluded';
-            TB = derive_columns(TB, includeRejected);
-            fprintf('  %s: excluded entirely\n', trial_label(TB, r));
-            RC = RC(~(RC.Block == TB.Block(r) & RC.TrialNum == TB.TrialNum(r) & RC.Attempt == TB.Attempt(r)), :);
-            RC = [RC; cell2table({TB.Block(r), TB.TrialNum(r), TB.Attempt(r), TB.OrigPosition{r}, ...
-                TB.OrigAngle(r), TB.Position{r}, TB.Angle(r), 'exclude', ...
-                char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm'))}, ...
-                'VariableNames', RC.Properties.VariableNames)];
-            save_reclass(RC, reclassFile);
-            axW = draw_walk_patterns(fW, TB, SER, P, roomLim);
-            drawnow;
-            continue
-        end
-        if sel == 11, newPos = TB.OrigPosition{r}; newAng = TB.OrigAngle(r);
-        else, newPos = pos9{sel}; newAng = angleOf(sel); end
-        TB.ManualExcluded(r) = ismember(TB.TrialNum(r), manualExclude);
-
-        E = walking_period(RAW{r}, newAng, P);
-        E = apply_epoch_mode(E, RAW{r}, epochMode, P);
-        TB.FullWalkStart(r) = E.fullStart;  TB.FullWalkEnd(r) = E.fullEnd;
-        TB.FullWalkDur(r) = E.fullEnd - E.fullStart;
-        TB.Position{r} = newPos;  TB.Angle(r) = newAng;
-        TB.Reclassified(r) = ~strcmp(newPos, TB.OrigPosition{r});
-        TB.StartsAtTraceStart(r) = E.startsAtTraceStart;
-        TB.behWalkStart(r) = E.walkStart;  TB.behWalkEnd(r) = E.walkEnd;
-        TB.WalkDur(r) = E.walkEnd - E.walkStart;
-        TB.SteadyDur(r) = E.steadyEnd - E.steadyStart;
-        TB.HeadMeanYaw(r)  = mean_yaw(RAWH{r}, E.walkStart, E.walkEnd, P);   % new walking period -> recompute yaw
-        TB.TorsoMeanYaw(r) = mean_yaw(RAW{r}, E.walkStart, E.walkEnd, P);
-        TB.Excluded{r} = E.excluded;
-        if TB.ManualExcluded(r), TB.Excluded{r} = 'manually excluded'; end
-        SER(r).ia = E.ia;  SER(r).ic = E.ic;
-        TB = derive_columns(TB, includeRejected);
-        if isempty(E.excluded)
-            fprintf('  %s -> %s: walk kept, walking period %.2f s (one epoch)\n', trial_label(TB, r), ...
-                newPos, TB.WalkDur(r));
-        else
-            fprintf('  %s -> %s: still excluded (%s)\n', trial_label(TB, r), newPos, E.excluded);
-        end
-
-        RC = RC(~(RC.Block == TB.Block(r) & RC.TrialNum == TB.TrialNum(r) & RC.Attempt == TB.Attempt(r)), :);
-        if TB.Reclassified(r)
-            RC = [RC; cell2table({TB.Block(r), TB.TrialNum(r), TB.Attempt(r), TB.OrigPosition{r}, ...
-                TB.OrigAngle(r), newPos, newAng, 'reclassify', ...
-                char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm'))}, ...
-                'VariableNames', RC.Properties.VariableNames)];
-        end
-        save_reclass(RC, reclassFile);
-
-        axW = draw_walk_patterns(fW, TB, SER, P, roomLim);
-        drawnow;
-    end
+    [TB, SER, RC] = reclassify_walks(fW, axW, TB, SER, RC, reclassFile, navFcn, navYaw, ...
+        'Navigation (StartPos trace)', manualExclude, includeRejected, P, roomLim);
 end
-isRej = strcmp(TB.TrialStatus, 'REJECTED');
-print_summary(TB, modeLabel);
-
-fprintf('\nAngle-specific (steady) part vs full walking period, kept walks:\n');
-fprintf('   %-4s %6s | %5s %10s %12s %10s %8s\n', 'Pos', 'angle', 'walks', 'full (s)', 'steady (s)', 'cut (s)', 'kept %');
-for p = 1:9
-    k = TB.Use & strcmp(TB.Position, pos9{p});
-    if ~any(k), continue; end
-    f = TB.FullWalkDur(k); s = TB.SteadyDur(k);
-    fprintf('   %-4s %+5g%s | %5d %10.2f %12.2f %10.2f %7.0f%%\n', pos9{p}, angleOf(p), char(176), nnz(k), ...
-        median(f), median(s), median(f - s), 100 * median(s ./ f));
-end
-f = TB.FullWalkDur(TB.Use); s = TB.SteadyDur(TB.Use);
-fprintf('   All: full %.2f s, steady %.2f s, cut %.2f s (medians), %.0f%% kept\n', ...
-    median(f), median(s), median(f - s), 100 * median(s ./ f));
-
-fF = draw_final_figure(TB, SER, P);
+print_summary(TB, modeLabel, 'NAVIGATION');
+print_steady(TB);
+fF = draw_final_figure(TB, SER, P, false);
 safe_write(fullfile(outDir, sprintf('walks_final_%s_p001.png', epochMode)), @(f) exportgraphics(fF, f, 'Resolution', 300));
 safe_write(fullfile(outDir, sprintf('walks_final_%s_p001.pdf', epochMode)), @(f) exportgraphics(fF, f, 'ContentType', 'vector'));
+
+% ---- PhysicallyWalk: the same, after picking up any navigation reclassification made above ----
+pwFcn = @(r, a) pw_period(RAWP{r}, a, P, epochMode);
+pwYaw = @(r, E) deal(mean_yaw(RAWPH{r}, E.walkStart, E.walkEnd, P), mean_yaw(RAWPT{r}, E.walkStart, E.walkEnd, P));
+[TP, SERP] = sync_pw_labels(TP, SERP, TB, RCP, navOnlyRC, pwFcn, pwYaw);
+TP = derive_columns(TP, includeRejected);
+fP  = figure('Color', 'w', 'Position', [60 40 1300 1300], 'Name', 'PhysicallyWalk walks');
+axP = draw_walk_patterns(fP, TP, SERP, P, roomLim, 'PhysicallyWalk (body position from the head tracker)');
+drawnow;
+if reclassifyInteractive
+    [TP, SERP, RCP] = reclassify_walks(fP, axP, TP, SERP, RCP, reclassFilePW, pwFcn, pwYaw, ...
+        'PhysicallyWalk (body position from the head tracker)', manualExclude, includeRejected, P, roomLim);
+end
+print_summary(TP, modeLabel, 'PHYSICALLYWALK');
+print_steady(TP);
+fFP = draw_final_figure(TP, SERP, P, true);
+safe_write(fullfile(outDir, sprintf('walks_final_pw_%s_p001.png', epochMode)), @(f) exportgraphics(fFP, f, 'Resolution', 300));
+safe_write(fullfile(outDir, sprintf('walks_final_pw_%s_p001.pdf', epochMode)), @(f) exportgraphics(fFP, f, 'ContentType', 'vector'));
+isRej = strcmp(TB.TrialStatus, 'REJECTED');
 
 if askBeforeEpoching
     reply = input('\nWalk patterns shown. Continue to MEG epoching (part 2)? [y/n]: ', 's');
@@ -309,48 +284,246 @@ for mm = 1:numel(M)
     fit(mm) = struct('block', M(mm).block, 'a', coef(1), 'b', coef(2));
 end
 
-% one epoch per walk: behWalkStart-behWalkEnd, which is already the window for the chosen epochMode
-keep = find(TB.Use & TB.nEpochs > 0);
-rowsL = [];
-for r = keep'
-    mm  = find([M.block] == TB.Block(r));
-    fs  = M(mm).fs;
-    map = @(t) fit(mm).a + fit(mm).b * t;
-    beg = round(map(TB.behWalkStart(r)));
-    fin = round(map(TB.behWalkEnd(r)));
-    if strcmp(epochMode, 'first3'), fin = beg + round(P.epochLen * fs) - 1; end   % exactly the same length for every walk
-    x = struct('EpochMode', epochMode, 'EpochLen', (fin - beg + 1) / fs, 'WalkDur', TB.WalkDur(r), ...
-        'FullWalkDur', TB.FullWalkDur(r), 'Block', TB.Block(r), 'File', M(mm).file, ...
-        'TrialNum', TB.TrialNum(r), 'Attempt', TB.Attempt(r), 'TrialStatus', TB.TrialStatus{r}, ...
-        'Position', TB.Position{r}, 'Angle', TB.Angle(r), ...
-        'HeadMeanYaw', TB.HeadMeanYaw(r), 'TorsoMeanYaw', TB.TorsoMeanYaw(r), ...
-        'OrigPosition', TB.OrigPosition{r}, 'Reclassified', TB.Reclassified(r), ...
-        'DistCode', TB.DistCode{r}, 'Epoch', 1, 'nEpochsInWalk', 1, ...
-        'behStart_s', TB.behWalkStart(r) - TB.behSetupStart(r), 'behEnd_s', TB.behWalkEnd(r) - TB.behSetupStart(r), ...
-        'fullWalkStart_s', TB.FullWalkStart(r) - TB.behSetupStart(r), 'fullWalkEnd_s', TB.FullWalkEnd(r) - TB.behSetupStart(r), ...
-        'begsample', beg, 'endsample', fin, 'nSamples', fin - beg + 1, ...
-        'timeRelSyncStart_s', (beg - M(mm).tZero) / fs);
-    rowsL = [rowsL; x];
-end
+% one epoch per walk (navigation and PhysicallyWalk), already the window for the chosen epochMode;
+% both phases use the same block clock mapping (Close Eyes triggers)
+rowsL = make_epoch_rows(TB, M, fit, P, epochMode);
+rowsP = make_epoch_rows(TP, M, fit, P, epochMode);
 
 EP = struct();
 EP.mode = epochMode;
-EP.full = struct2table(rowsL);   % the epochs table (kept under this name for the scripts that read it)
-EP.note = [modeLabel, '; one epoch per walk; WalkDur = epoch window, FullWalkDur / fullWalkStart_s / fullWalkEnd_s = ', ...
+EP.full = struct2table(rowsL);   % navigation epochs (kept under this name for the scripts that read it)
+EP.pw   = table();               % PhysicallyWalk epochs, same columns
+if ~isempty(rowsP), EP.pw = struct2table(rowsP); end
+EP.note = [modeLabel, '; one epoch per walk; EP.full = navigation (StartPos trace), EP.pw = PhysicallyWalk; ', ...
+    'WalkDur = epoch window, FullWalkDur / fullWalkStart_s / fullWalkEnd_s = ', ...
     'the whole speed-based walking period for reference; ', ...
-    'behStart_s / behEnd_s are seconds from the start of the StartPos trace; ', ...
+    'behStart_s / behEnd_s are seconds from the start of the StartPos trace (EP.full) or of the PhysicallyWalk ', ...
+    'trace after its stale start frames (EP.pw); ', ...
     'begsample / endsample index the continuous file in File; ', ...
     'timeRelSyncStart_s is the epoch start relative to the sync pulse (t_zero), as timeRelSec; ', ...
     'HeadMeanYaw / TorsoMeanYaw are circular-mean yaw (deg, 0-360) over the epoch window, live tracker frames only ', ...
-    '(frozen runs >= P.hold s left out; NaN if < P.minLive s of live frames).'];
+    '(frozen runs >= P.hold s left out; NaN if < P.minLive s of live frames). ', ...
+    'PhysicallyWalk walking period: body position from the head tracker, direction = start angle + 180, ', ...
+    sprintf('speed > %g m/s, walk must start within %g deg of the start position.', P.pwSpeedThr, P.startTol)];
 outName = sprintf('walk_epochs_%s_p001', epochMode);   % walk_epochs_first3_p001 / _full_ / _stableyaw_
 fM = safe_write(fullfile(outDir, [outName '.mat']), @(f) save_ep(f, EP));
 fC = safe_write(fullfile(outDir, [outName '.csv']), @(f) writetable(struct2table(rowsL), f));
 len = [rowsL.EpochLen];
-fprintf('\nEpoching file saved (%s): %d epochs, one per walk, %.2f-%.2f s long (mean %.2f, median %.2f s)\n   %s\n   %s\n', ...
+fprintf('\nEpoching file saved (%s): %d navigation epochs, one per walk, %.2f-%.2f s long (mean %.2f, median %.2f s)\n   %s\n   %s\n', ...
     epochMode, numel(rowsL), min(len), max(len), mean(len), median(len), fM, fC);
+if ~isempty(rowsP)
+    fCP = safe_write(fullfile(outDir, sprintf('walk_epochs_%s_pw_p001.csv', epochMode)), @(f) writetable(EP.pw, f));
+    len = [rowsP.EpochLen];
+    fprintf('   + %d PhysicallyWalk epochs (EP.pw), %.2f-%.2f s long (mean %.2f, median %.2f s)\n   %s\n', ...
+        numel(rowsP), min(len), max(len), mean(len), median(len), fCP);
+end
 
-function fF = draw_final_figure(TB, SER, P)
+function [T, SER, RC] = reclassify_walks(fW, axW, T, SER, RC, rcFile, periodFcn, yawFcn, ttl, manualExclude, includeRejected, P, roomLim)
+% Click walks in the walk-pattern figure to move them to another angle or exclude them; changes go to rcFile.
+% periodFcn(r, angle) -> walking period E for row r at that angle; yawFcn(r, E) -> [head, torso] mean yaw.
+% A row is written to rcFile when the walk's label differs from T.BasePosition (navigation: the original label;
+% PhysicallyWalk: the label carried over from navigation).
+pos9    = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
+angleOf = arrayfun(@(k) T.OrigAngle(find(strcmp(T.OrigPosition, pos9{k}), 1)), 1:9);
+answer = questdlg({sprintf('%s:', ttl), 'Do you want to move any walk to a different angle,', ...
+    'or leave a walk out of the analysis?', '', ...
+    'Yes: click walks in the figure.  No: continue as shown.'}, ...
+    'Reclassify or exclude walks', 'Yes', 'No', 'No');
+while strcmp(answer, 'Yes')
+    figure(fW);
+    fprintf(['\n%s: click the walk you want to change in the figure.\n', ...
+        'When you are done, press Enter with the figure window selected.\n'], ttl);
+    [xc, yc] = ginput(1);
+    if isempty(xc), break; end
+    p = find(axW == gca, 1);
+    if isempty(p), continue; end
+    cand = find(strcmp(T.Position, pos9{p}));
+    dmin = inf(size(cand));
+    for q = 1:numel(cand)
+        S = SER(cand(q));
+        if ~isempty(S.x), dmin(q) = min(hypot(S.x - xc, S.z - yc)); end
+    end
+    [dBest, q] = min(dmin);
+    if isempty(cand) || dBest > 0.25
+        fprintf('  No walk within 0.25 m of that click in %s.\n', pos9{p});
+        continue
+    end
+    r = cand(q);
+    hSel = plot(axW(p), SER(r).x, SER(r).z, 'k-', 'LineWidth', 4); drawnow;
+
+    if T.ManualExcluded(r), stateTxt = 'excluded by hand';
+    elseif isempty(T.Excluded{r}), stateTxt = 'kept';
+    else, stateTxt = ['excluded: ' T.Excluded{r}]; end
+    opts = [arrayfun(@(k) sprintf('%s (%g deg)', pos9{k}, angleOf(k)), 1:9, 'UniformOutput', false), ...
+        {'EXCLUDE ENTIRELY', sprintf('restore %s (no manual changes)', T.BasePosition{r}), 'cancel'}];
+    sel = listdlg('PromptString', {trial_label(T, r), sprintf('labelled %s, shown under %s, %s.', T.OrigPosition{r}, T.Position{r}, ...
+        stateTxt), 'New angle, or exclude:'}, 'SelectionMode', 'single', 'ListString', opts, ...
+        'ListSize', [320 250]);
+    delete(hSel);
+    if isempty(sel) || sel == numel(opts), continue; end
+    RC = RC(~(RC.Block == T.Block(r) & RC.TrialNum == T.TrialNum(r) & RC.Attempt == T.Attempt(r)), :);
+    if sel == 10
+        T.ManualExcluded(r) = true;
+        T.Excluded{r} = 'manually excluded';
+        T = derive_columns(T, includeRejected);
+        fprintf('  %s: excluded entirely\n', trial_label(T, r));
+        RC = [RC; cell2table({T.Block(r), T.TrialNum(r), T.Attempt(r), T.OrigPosition{r}, ...
+            T.OrigAngle(r), T.Position{r}, T.Angle(r), 'exclude', ...
+            char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm'))}, ...
+            'VariableNames', RC.Properties.VariableNames)];
+        save_reclass(RC, rcFile);
+        axW = draw_walk_patterns(fW, T, SER, P, roomLim, ttl);
+        drawnow;
+        continue
+    end
+    if sel == 11, newPos = T.BasePosition{r}; newAng = T.BaseAngle(r);
+    else, newPos = pos9{sel}; newAng = angleOf(sel); end
+    T.ManualExcluded(r) = ismember(T.TrialNum(r), manualExclude);
+    T.Position{r} = newPos;  T.Angle(r) = newAng;
+    T.Reclassified(r) = ~strcmp(newPos, T.OrigPosition{r});
+    E = periodFcn(r, newAng);
+    [hy, ty] = yawFcn(r, E);                  % new walking period -> recompute yaw
+    [T, SER] = set_walk(T, SER, r, E, hy, ty);
+    T = derive_columns(T, includeRejected);
+    if isempty(E.excluded)
+        fprintf('  %s -> %s: walk kept, walking period %.2f s (one epoch)\n', trial_label(T, r), ...
+            newPos, T.WalkDur(r));
+    else
+        fprintf('  %s -> %s: still excluded (%s)\n', trial_label(T, r), newPos, E.excluded);
+    end
+    if ~strcmp(newPos, T.BasePosition{r})
+        RC = [RC; cell2table({T.Block(r), T.TrialNum(r), T.Attempt(r), T.OrigPosition{r}, ...
+            T.OrigAngle(r), newPos, newAng, 'reclassify', ...
+            char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm'))}, ...
+            'VariableNames', RC.Properties.VariableNames)];
+    end
+    save_reclass(RC, rcFile);
+    axW = draw_walk_patterns(fW, T, SER, P, roomLim, ttl);
+    drawnow;
+end
+end
+
+function [T, SER] = set_walk(T, SER, r, E, hy, ty)
+% write a new walking period (and its mean yaw) into row r
+T.FullWalkStart(r) = E.fullStart;  T.FullWalkEnd(r) = E.fullEnd;
+T.FullWalkDur(r) = E.fullEnd - E.fullStart;
+T.StartsAtTraceStart(r) = E.startsAtTraceStart;
+T.behWalkStart(r) = E.walkStart;  T.behWalkEnd(r) = E.walkEnd;
+T.WalkDur(r) = E.walkEnd - E.walkStart;
+T.SteadyDur(r) = E.steadyEnd - E.steadyStart;
+T.HeadMeanYaw(r) = hy;  T.TorsoMeanYaw(r) = ty;
+T.Excluded{r} = E.excluded;
+if T.ManualExcluded(r), T.Excluded{r} = 'manually excluded'; end
+SER(r).ia = E.ia;  SER(r).ic = E.ic;
+end
+
+function [TP, SERP] = sync_pw_labels(TP, SERP, TB, RCP, navOnlyRC, pwFcn, pwYaw)
+% Navigation reclassifications made in this run carry over to PhysicallyWalk (except navOnlyRC and walks that
+% have their own PhysicallyWalk entry in RCP).
+for r = 1:height(TP)
+    n = find(TB.Block == TP.Block(r) & TB.TrialNum == TP.TrialNum(r) & TB.Attempt == TP.Attempt(r), 1);
+    if isempty(n), continue; end
+    if TB.Reclassified(n) && ~ismember([TP.Block(r) TP.TrialNum(r) TP.Attempt(r)], navOnlyRC, 'rows')
+        nb = TB.Position{n}; na = TB.Angle(n);
+    else
+        nb = TP.OrigPosition{r}; na = TP.OrigAngle(r);
+    end
+    if strcmp(nb, TP.BasePosition{r}), continue; end
+    TP.BasePosition{r} = nb; TP.BaseAngle(r) = na;
+    if any(RCP.Block == TP.Block(r) & RCP.TrialNum == TP.TrialNum(r) & RCP.Attempt == TP.Attempt(r)), continue; end
+    TP.Position{r} = nb; TP.Angle(r) = na;
+    TP.Reclassified(r) = ~strcmp(nb, TP.OrigPosition{r});
+    E = pwFcn(r, na);
+    [hy, ty] = pwYaw(r, E);
+    [TP, SERP] = set_walk(TP, SERP, r, E, hy, ty);
+    fprintf('  PhysicallyWalk %s: label from navigation -> %s\n', trial_label(TP, r), nb);
+end
+end
+
+function E = nav_period(sp, ang, P, mode)
+% navigation walking period (StartPos torso trace) turned into this run's epoch window
+E = walking_period(sp, ang, P);
+E = apply_epoch_mode(E, sp, mode, P);
+end
+
+function E = pw_period(bd, ang, P, mode)
+% PhysicallyWalk walking period: body trace (from the head), walking back to the centre (direction = angle + 180),
+% lower speed threshold, and the walk must START at the start position
+Q = P; Q.speedThr = P.pwSpeedThr;
+E = walking_period(bd, mod(ang + 360, 360) - 180, Q, ang);
+E = apply_epoch_mode(E, bd, mode, P);
+end
+
+function tr = body_from_head(tr, P)
+% body position from the head tracker: the head point sits P.headOff m in front of the body along (yaw - P.headAng).
+% Yaw is left as head yaw; frozen head frames stay identical, so they are still found as frozen.
+if isempty(tr) || ~isfield(tr, 'time') || ~isfield(tr, 'yaw') || ~isfield(tr, 'x') || ~isfield(tr, 'z'), return; end
+y = double(tr.yaw(:));
+tr.x = double(tr.x(:)) - P.headOff * sind(y - P.headAng);
+tr.z = double(tr.z(:)) - P.headOff * cosd(y - P.headAng);
+end
+
+function tr = trim_stale(tr, P)
+% start the trace after the last single-frame jump (> P.jumpThr m or > P.yawJump deg) in its first P.jumpWin s
+% (the tracker holding an old pose at the start of the trace)
+if isempty(tr) || ~isfield(tr, 'time') || ~isfield(tr, 'yaw') || numel(tr.time) < 3, return; end
+t = double(tr.time(:)); x = double(tr.x(:)); z = double(tr.z(:)); y = double(tr.yaw(:));
+dyaw = abs(mod(diff(y) + 180, 360) - 180);
+k = find((hypot(diff(x), diff(z)) > P.jumpThr | dyaw > P.yawJump) & (t(2:end) - t(1)) <= P.jumpWin, 1, 'last');
+if isempty(k), return; end
+n = numel(tr.time); f = fieldnames(tr);
+for q = 1:numel(f)
+    v = tr.(f{q});
+    if numel(v) == n, v = v(:); tr.(f{q}) = v(k + 1:end); end
+end
+end
+
+function print_steady(T)
+pos9    = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
+angleOf = arrayfun(@(k) T.OrigAngle(find(strcmp(T.OrigPosition, pos9{k}), 1)), 1:9);
+fprintf('\nAngle-specific (steady) part vs full walking period, kept walks:\n');
+fprintf('   %-4s %6s | %5s %10s %12s %10s %8s\n', 'Pos', 'angle', 'walks', 'full (s)', 'steady (s)', 'cut (s)', 'kept %');
+for p = 1:9
+    k = T.Use & strcmp(T.Position, pos9{p});
+    if ~any(k), continue; end
+    f = T.FullWalkDur(k); s = T.SteadyDur(k);
+    fprintf('   %-4s %+5g%s | %5d %10.2f %12.2f %10.2f %7.0f%%\n', pos9{p}, angleOf(p), char(176), nnz(k), ...
+        median(f), median(s), median(f - s), 100 * median(s ./ f));
+end
+f = T.FullWalkDur(T.Use); s = T.SteadyDur(T.Use);
+fprintf('   All: full %.2f s, steady %.2f s, cut %.2f s (medians), %.0f%% kept\n', ...
+    median(f), median(s), median(f - s), 100 * median(s ./ f));
+end
+
+function rowsL = make_epoch_rows(T, M, fit, P, epochMode)
+% one epoch per walk: behWalkStart-behWalkEnd, which is already the window for the chosen epochMode
+keep = find(T.Use & T.nEpochs > 0);
+rowsL = [];
+for r = keep'
+    mm  = find([M.block] == T.Block(r));
+    fs  = M(mm).fs;
+    map = @(t) fit(mm).a + fit(mm).b * t;
+    beg = round(map(T.behWalkStart(r)));
+    fin = round(map(T.behWalkEnd(r)));
+    if strcmp(epochMode, 'first3'), fin = beg + round(P.epochLen * fs) - 1; end   % exactly the same length for every walk
+    x = struct('EpochMode', epochMode, 'EpochLen', (fin - beg + 1) / fs, 'WalkDur', T.WalkDur(r), ...
+        'FullWalkDur', T.FullWalkDur(r), 'Block', T.Block(r), 'File', M(mm).file, ...
+        'TrialNum', T.TrialNum(r), 'Attempt', T.Attempt(r), 'TrialStatus', T.TrialStatus{r}, ...
+        'Position', T.Position{r}, 'Angle', T.Angle(r), ...
+        'HeadMeanYaw', T.HeadMeanYaw(r), 'TorsoMeanYaw', T.TorsoMeanYaw(r), ...
+        'OrigPosition', T.OrigPosition{r}, 'Reclassified', T.Reclassified(r), ...
+        'DistCode', T.DistCode{r}, 'Epoch', 1, 'nEpochsInWalk', 1, ...
+        'behStart_s', T.behWalkStart(r) - T.behSetupStart(r), 'behEnd_s', T.behWalkEnd(r) - T.behSetupStart(r), ...
+        'fullWalkStart_s', T.FullWalkStart(r) - T.behSetupStart(r), 'fullWalkEnd_s', T.FullWalkEnd(r) - T.behSetupStart(r), ...
+        'begsample', beg, 'endsample', fin, 'nSamples', fin - beg + 1, ...
+        'timeRelSyncStart_s', (beg - M(mm).tZero) / fs);
+    rowsL = [rowsL; x]; %#ok<AGROW>
+end
+end
+
+function fF = draw_final_figure(TB, SER, P, labelAtStart)
+% labelAtStart: put the angle labels at the walk start (PhysicallyWalk ends at the centre) instead of the end
+if nargin < 4, labelAtStart = false; end
 pos9 = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
 cols = [0.031 0.188 0.420; 0.129 0.400 0.675; 0.263 0.576 0.765; 0.553 0.722 0.847; 0.302 0.302 0.302; ...
         0.910 0.627 0.498; 0.839 0.376 0.302; 0.698 0.094 0.169; 0.404 0.000 0.122];
@@ -363,7 +536,7 @@ for k = 1:9
         S = SER(kp(n));
         w = S.ia:S.ic;
         plot(ax, S.x(w), S.z(w), '-', 'Color', [cols(k, :) 0.9], 'LineWidth', 2.2);   % whole walking period = the epoch
-        ends(n, :) = [S.x(S.ic), S.z(S.ic)];
+        if labelAtStart, ends(n, :) = [S.x(S.ia), S.z(S.ia)]; else, ends(n, :) = [S.x(S.ic), S.z(S.ic)]; end
     end
     if isempty(kp), continue; end
     e = median(ends, 1); e = e / norm(e) * (norm(e) + 0.22);
@@ -497,7 +670,8 @@ TB.Use = walkOK & (~isRej | includeRejected);
 TB.nEpochs = double(walkOK & isfinite(TB.WalkDur) & TB.WalkDur > 0);   % one epoch per walk: the whole walking period
 end
 
-function print_summary(TB, modeLabel)
+function print_summary(TB, modeLabel, phaseName)
+if nargin > 2, fprintf('\n==================== %s ====================\n', phaseName); end
 pos9   = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
 dcList = {'D1', 'D2', 'D3'};
 deg    = @(a) strrep(sprintf('%+g%s', a, char(176)), '+0', '0');
@@ -553,7 +727,7 @@ if nnz(k) < P.minLive * P.fs, return; end
 m = mod(atan2d(mean(sind(yq(k))), mean(cosd(yq(k)))), 360);
 end
 
-function axW = draw_walk_patterns(fW, TB, SER, P, roomLim)
+function axW = draw_walk_patterns(fW, TB, SER, P, roomLim, ttl)
 clf(fW);
 pos9   = arrayfun(@(k) sprintf('A%d', k), 1:9, 'UniformOutput', false);
 dcList = {'D1', 'D2', 'D3'};
@@ -563,6 +737,7 @@ isRej  = strcmp(TB.TrialStatus, 'REJECTED');
 walkOK = cellfun(@isempty, TB.Excluded);
 kept   = find(TB.Use);
 tlW = tiledlayout(fW, 3, 3, 'TileSpacing', 'compact');
+if nargin > 5, title(tlW, ttl, 'FontWeight', 'bold'); end
 axW = gobjects(1, 9);
 for p = 1:9
     axW(p) = nexttile(tlW); hold on; box on; axis equal;
@@ -650,7 +825,10 @@ t = NaN;
 if ~isempty(tr) && isfield(tr, 'time') && ~isempty(tr.time), t = max(double(tr.time(:))); end
 end
 
-function E = walking_period(tr, label, P)
+function E = walking_period(tr, label, P, startAngle)
+% startAngle given (PhysicallyWalk): the walk must START within P.startTol of that angle; otherwise (navigation)
+% it must END within P.endTol of label
+if nargin < 4, startAngle = []; end
 E = struct('walkStart', NaN, 'walkEnd', NaN, 'steadyStart', NaN, 'steadyEnd', NaN, 'excluded', 'no walk recording', ...
     'tRel', [], 'speed', [], 'x', [], 'z', [], 'ia', NaN, 'ic', NaN, 'startsAtTraceStart', false, 't0', NaN);
 if isempty(tr) || ~isfield(tr, 'time') || numel(tr.time) < 2, return; end
@@ -675,9 +853,16 @@ if len == 0, E.excluded = 'no steady walk'; return; end
 if (i2 - i1) / fs - 2 * P.trim < P.chunk
     E.excluded = 'steady walk < 1 s after trimming'; return
 end
-endAngle = atan2d(x(end), -z(end));
-if abs(mod(endAngle - label + 180, 360) - 180) > P.endTol
-    E.excluded = sprintf('ends > %g deg from start position', P.endTol); return
+if isempty(startAngle)
+    endAngle = atan2d(x(end), -z(end));
+    if abs(mod(endAngle - label + 180, 360) - 180) > P.endTol
+        E.excluded = sprintf('ends > %g deg from start position', P.endTol); return
+    end
+else
+    begAngle = atan2d(x(1), -z(1));
+    if abs(mod(begAngle - startAngle + 180, 360) - 180) > P.startTol
+        E.excluded = sprintf('starts > %g deg from start position', P.startTol); return
+    end
 end
 thr = P.plateauFrac * median(spd(i1:i2));
 a = i1; while a > 1 && spd(a - 1) > thr, a = a - 1; end
